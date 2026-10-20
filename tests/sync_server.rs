@@ -455,6 +455,8 @@ fn generate_certificates(dir: &Path) {
             "copy",
         ],
     );
+    // Explicit extensions ensure a v3 client certificate on OpenSSL 3.0 too.
+    // Without them, its default v1 certificate is rejected by Rustls.
     run_openssl(
         dir,
         &[
@@ -468,6 +470,12 @@ fn generate_certificates(dir: &Path) {
             "client.csr",
             "-subj",
             "/CN=couch-tasks-test-client",
+            "-addext",
+            "basicConstraints=critical,CA:FALSE",
+            "-addext",
+            "keyUsage=critical,digitalSignature,keyEncipherment",
+            "-addext",
+            "extendedKeyUsage=clientAuth",
         ],
     );
     run_openssl(
@@ -486,6 +494,8 @@ fn generate_certificates(dir: &Path) {
             "client.crt",
             "-days",
             "1",
+            "-copy_extensions",
+            "copy",
         ],
     );
 }
