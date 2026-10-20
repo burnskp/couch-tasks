@@ -1,0 +1,16 @@
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks-system
+        pass_filenames: false
+  - repo: local
+    hooks:
+      - id: project-check
+        name: Project checks (format, lint, tests, completion)
+        entry: just check
+        language: system
+        pass_filenames: false
+        always_run: true
+        require_serial: true
+        stages: [pre-commit]

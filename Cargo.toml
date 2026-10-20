@@ -1,0 +1,42 @@
+[package]
+name = "couch-tasks"
+version = "0.1.0"
+edition = "2024"
+default-run = "ct"
+description = "Local-first project-based task CLI and mTLS sync server"
+license = "MIT"
+repository = "https://github.com/burnskp/couch-tasks"
+readme = "README.md"
+
+[[bin]]
+name = "ct"
+path = "src/main.rs"
+
+[[bin]]
+name = "ct-sync-server"
+path = "src/bin/ct-sync-server.rs"
+
+[dependencies]
+chrono = { version = "0.4.44", features = ["clock"] }
+axum = "0.8.7"
+axum-server = "0.7.3"
+clap = "4.6.1"
+dirs = "6.0.0"
+reqwest = { version = "0.12.24", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+rustls = "0.23.46"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal"] }
+tokio-rustls = "0.26.4"
+tower-service = "0.3.3"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+uuid = { version = "1.23.1", features = ["v4"] }
+x509-parser = "0.18.1"
+
+[dev-dependencies]
+assert_cmd = "2.2.1"
+predicates = "3.1.4"

@@ -1,0 +1,28 @@
+/target
+/build
+/.pi/
+/.sync-test/
+result
+result*
+.direnv
+
+# Local credentials and provisioning artifacts.
+*.key
+*.pem
+*.crt
+*.cer
+*.csr
+*.srl
+*.p12
+*.pfx
+.env
+.env.*
+
+# Local task data and SQLite sidecars.
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.list-ids.json

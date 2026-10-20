@@ -1,0 +1,106 @@
+#compdef ct
+
+_ct_commands=(
+  'add:Add a task to a project'
+  'quick:Quick add a task to inbox'
+  'list:List pending tasks'
+  'completed:List completed tasks for a project'
+  'clear-completed:Delete completed tasks'
+  'done:Mark tasks done'
+  'undone:Restore completed tasks to pending'
+  'delete:Delete tasks'
+  'move:Move a task to another project'
+  'update:Update task fields without opening an editor'
+  'reorder:Reorder a pending task within its project'
+  'edit:Edit a task in $EDITOR'
+  'note:Append a note to a task'
+  'show:Show task details'
+  'sync:Sync tasks'
+)
+
+_ct_projects() {
+  local -a projects
+  projects=(${(f)"$(_call_program projects ct _complete projects 2>/dev/null)"})
+  _describe -t projects 'project' projects
+}
+
+_ct() {
+  local curcontext="$curcontext" state line
+  typeset -A opt_args
+
+  _arguments -C \
+    '1:command or project:->command_or_project' \
+    '*::arg:->args'
+
+  case $state in
+    command_or_project)
+      _alternative \
+        'commands:command: _describe -t commands command _ct_commands' \
+        'projects:project:_ct_projects'
+      ;;
+    args)
+      case $line[1] in
+        add)
+          if (( CURRENT == 2 )); then
+            _ct_projects
+          else
+            _message 'task title'
+          fi
+          ;;
+        list)
+          _arguments '--notes[show notes under tasks]' '--json[output tasks as JSON]' '*:project:_ct_projects'
+          ;;
+        completed)
+          _arguments '--json[output tasks as JSON]' '*:project:_ct_projects'
+          ;;
+        clear-completed)
+          _ct_projects
+          ;;
+        move)
+          if (( CURRENT == 3 )); then
+            _ct_projects
+          else
+            _message 'task id'
+          fi
+          ;;
+        done|undone|delete|edit|show)
+          _message 'task id'
+          ;;
+        update)
+          _arguments \
+            '1:task id:' \
+            '--project[set project]:project:_ct_projects' \
+            '--title[set title]:title:' \
+            '--notes[replace notes]:notes:'
+          ;;
+        reorder)
+          if (( CURRENT == 2 )); then
+            _message 'task id'
+          else
+            _message 'position'
+          fi
+          ;;
+        note)
+          if (( CURRENT == 2 )); then
+            _message 'task id'
+          else
+            _message 'note'
+          fi
+          ;;
+        quick)
+          _message 'task title'
+          ;;
+        sync)
+          _arguments \
+            '(-v --verbose)'{-v,--verbose}'[show the resulting sync checkpoint]' \
+            '--url[sync server URL]:url:' \
+            '--cert[client certificate path]:certificate file:_files' \
+            '--key[client private key path]:key file:_files' \
+            '--ca[server CA certificate path]:CA file:_files'
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_ct "$@"
