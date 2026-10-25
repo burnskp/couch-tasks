@@ -411,6 +411,20 @@ mod tests {
 
     use super::{AppState, ClientIdentity, certificate_common_name, load_certs, sync};
 
+    /// Install a discarding subscriber for this thread.
+    ///
+    /// Handler tests that run without any subscriber can stop concurrently
+    /// running tests' scoped subscribers from receiving events from the same
+    /// log callsites, so every handler test that does not inspect logs should
+    /// hold this guard.
+    fn quiet_logs() -> tracing::subscriber::DefaultGuard {
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .finish(),
+        )
+    }
+
     #[test]
     fn certificate_common_name_reads_client_certificate_cn() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -443,6 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_handler_classifies_bad_requests_and_conflicts() {
+        let _logs = quiet_logs();
         let dir = tempfile::tempdir().expect("temp dir");
         let storage = Storage::open(dir.path().join("server.db")).expect("open server");
         let mut bad_request = storage.export_sync_request().expect("export request");
@@ -545,6 +560,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_handler_preserves_json_rejection_status() {
+        let _logs = quiet_logs();
         let dir = tempfile::tempdir().expect("temp dir");
         let state = AppState {
             max_request_bytes: super::DEFAULT_MAX_REQUEST_BYTES,
