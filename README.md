@@ -90,7 +90,7 @@ package installs the completion file automatically.
 
 ## Guides
 
-- [Using ct](cli.md): projects, tasks, notes, editing, and completed work.
+- [Using ct](cli.md): projects, tasks, notes, editing, reviews, and completed work.
 - [Scripts and widgets](task-usage.md): JSON output and UUID-based commands.
 - [Sync setup](docs/sync.md): connect devices, run a server, and troubleshoot.
 - [Nix setup](docs/nix.md): install with Nix or Home Manager and host on NixOS.

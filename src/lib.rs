@@ -1,9 +1,11 @@
 pub mod cli;
 pub mod commands;
+pub mod config;
 pub mod editor;
 pub mod error;
 pub mod models;
 pub mod output;
+pub mod review;
 pub mod storage;
 pub mod sync_client;
 pub mod sync_protocol;

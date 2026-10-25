@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -19,7 +19,7 @@ use crate::{
     },
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const INBOX: &str = "inbox";
 
 pub struct Storage {
@@ -63,6 +63,7 @@ impl Storage {
 
         match version {
             0 => self.create_schema()?,
+            3 => self.migrate_v3_to_v4()?,
             SCHEMA_VERSION => {}
             version => {
                 return Err(AppError::StorageMessage(format!(
@@ -102,7 +103,8 @@ impl Storage {
               updated_at TEXT NOT NULL,
               completed_at TEXT,
               sync_revision INTEGER NOT NULL DEFAULT 0,
-              sync_dirty INTEGER NOT NULL DEFAULT 1
+              sync_dirty INTEGER NOT NULL DEFAULT 1,
+              reviewed_at TEXT NOT NULL
             );
 
             CREATE TABLE sync_tombstones (
@@ -125,6 +127,24 @@ impl Storage {
             "
         ))?;
         Ok(())
+    }
+
+    fn migrate_v3_to_v4(&self) -> Result<(), AppError> {
+        self.in_immediate_transaction(|| {
+            self.conn.execute_batch(
+                "
+                ALTER TABLE tasks ADD COLUMN reviewed_at TEXT NOT NULL DEFAULT '';
+                UPDATE tasks SET reviewed_at = created_at;
+                PRAGMA user_version = 4;
+                ",
+            )?;
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
     }
 
     pub fn ensure_project(&self, name: &str) -> Result<Project, AppError> {
@@ -194,8 +214,10 @@ impl Storage {
         let now = now_timestamp();
         self.conn.execute(
             "
-            INSERT INTO tasks (uuid, project_id, sort_order, title, notes, status, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, '', ?5, ?6, ?6)
+            INSERT INTO tasks (
+              uuid, project_id, sort_order, title, notes, status, created_at, updated_at, reviewed_at
+            )
+            VALUES (?1, ?2, ?3, ?4, '', ?5, ?6, ?6, ?6)
             ",
             params![
                 Uuid::new_v4().to_string(),
@@ -217,7 +239,7 @@ impl Storage {
             .query_row(
                 "
                 SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
-                       t.status, t.created_at, t.updated_at, t.completed_at
+                       t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at
                 FROM tasks t
                 JOIN projects p ON p.id = t.project_id
                 WHERE t.id = ?1
@@ -234,7 +256,7 @@ impl Storage {
             .query_row(
                 "
                 SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
-                       t.status, t.created_at, t.updated_at, t.completed_at
+                       t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at
                 FROM tasks t
                 JOIN projects p ON p.id = t.project_id
                 WHERE t.uuid = ?1
@@ -279,7 +301,7 @@ impl Storage {
         let mut statement = self.conn.prepare(
             "
             SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
-                   t.status, t.created_at, t.updated_at, t.completed_at
+                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at
             FROM tasks t
             JOIN projects p ON p.id = t.project_id
             WHERE t.status = 'pending'
@@ -307,7 +329,7 @@ impl Storage {
         let mut statement = self.conn.prepare(
             "
             SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
-                   t.status, t.created_at, t.updated_at, t.completed_at
+                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at
             FROM tasks t
             JOIN projects p ON p.id = t.project_id
             WHERE t.status = 'pending'
@@ -326,7 +348,7 @@ impl Storage {
         let mut statement = self.conn.prepare(
             "
             SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
-                   t.status, t.created_at, t.updated_at, t.completed_at
+                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at
             FROM tasks t
             JOIN projects p ON p.id = t.project_id
             WHERE t.status = 'done'
@@ -354,7 +376,7 @@ impl Storage {
         let mut statement = self.conn.prepare(
             "
             SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
-                   t.status, t.created_at, t.updated_at, t.completed_at
+                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at
             FROM tasks t
             JOIN projects p ON p.id = t.project_id
             WHERE t.status = 'done'
@@ -367,6 +389,67 @@ impl Storage {
             .query_map(params![project.id], task_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Some((project, tasks)))
+    }
+
+    pub fn review_projects(&self, cutoff: &str) -> Result<Vec<Project>, AppError> {
+        let mut statement = self.conn.prepare(
+            "
+            SELECT p.id, p.uuid, p.name, p.name_normalized, p.created_at, p.updated_at,
+                   p.archived_at
+            FROM projects p
+            WHERE EXISTS (
+              SELECT 1 FROM tasks t
+              WHERE t.project_id = p.id
+                AND t.status = 'pending'
+                AND (p.name_normalized = 'inbox' OR t.reviewed_at <= ?1)
+            )
+            ORDER BY CASE WHEN p.name_normalized = 'inbox' THEN 0 ELSE 1 END,
+                     p.name COLLATE NOCASE
+            ",
+        )?;
+
+        let projects = statement
+            .query_map(params![cutoff], project_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(projects)
+    }
+
+    pub fn review_tasks_for_project(
+        &self,
+        project_id: i64,
+        cutoff: &str,
+    ) -> Result<Vec<Task>, AppError> {
+        let mut statement = self.conn.prepare(
+            "
+            SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
+                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at
+            FROM tasks t
+            JOIN projects p ON p.id = t.project_id
+            WHERE t.status = 'pending'
+              AND p.id = ?1
+              AND (p.name_normalized = 'inbox' OR t.reviewed_at <= ?2)
+            ORDER BY t.sort_order, t.id
+            ",
+        )?;
+
+        let tasks = statement
+            .query_map(params![project_id, cutoff], task_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
+    pub fn mark_reviewed(&self, id: i64) -> Result<Option<Task>, AppError> {
+        let now = now_timestamp();
+        self.conn.execute(
+            "
+            UPDATE tasks
+            SET reviewed_at = ?1, sync_dirty = 1
+            WHERE id = ?2
+            ",
+            params![now, id],
+        )?;
+
+        self.get_task(id)
     }
 
     pub fn mark_done(&self, id: i64) -> Result<Option<Task>, AppError> {
@@ -1187,7 +1270,7 @@ impl Storage {
                 "
                 SELECT t.uuid, p.uuid, t.sort_order, t.title, t.notes, t.status,
                        t.created_at, t.updated_at, t.completed_at, t.sync_revision,
-                       t.sync_dirty
+                       t.sync_dirty, t.reviewed_at
                 FROM tasks t
                 JOIN projects p ON p.id = t.project_id
                 WHERE t.uuid = ?1
@@ -1454,28 +1537,15 @@ impl Storage {
         let mut statement = self.conn.prepare(
             "
             SELECT t.uuid, p.uuid, t.sort_order, t.title, t.notes, t.status,
-                   t.created_at, t.updated_at, t.completed_at, t.sync_revision, t.sync_dirty
+                   t.created_at, t.updated_at, t.completed_at, t.sync_revision, t.sync_dirty,
+                   t.reviewed_at
             FROM tasks t
             JOIN projects p ON p.id = t.project_id
             ORDER BY p.name_normalized, t.sort_order, t.id
             ",
         )?;
         statement
-            .query_map([], |row| {
-                Ok(SyncTask {
-                    uuid: row.get(0)?,
-                    project_uuid: row.get(1)?,
-                    sort_order: row.get(2)?,
-                    title: row.get(3)?,
-                    notes: row.get(4)?,
-                    status: row.get(5)?,
-                    created_at: row.get(6)?,
-                    updated_at: row.get(7)?,
-                    completed_at: row.get(8)?,
-                    sync_revision: row.get(9)?,
-                    sync_dirty: row.get::<_, i64>(10)? != 0,
-                })
-            })?
+            .query_map([], sync_task_from_row)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(AppError::from)
     }
@@ -1518,7 +1588,8 @@ impl Storage {
         let mut statement = self.conn.prepare(
             "
             SELECT t.uuid, p.uuid, t.sort_order, t.title, t.notes, t.status,
-                   t.created_at, t.updated_at, t.completed_at, t.sync_revision, t.sync_dirty
+                   t.created_at, t.updated_at, t.completed_at, t.sync_revision, t.sync_dirty,
+                   t.reviewed_at
             FROM tasks t
             JOIN projects p ON p.id = t.project_id
             WHERE t.sync_revision > ?1
@@ -1618,8 +1689,8 @@ impl Storage {
             "
             INSERT INTO tasks (
               uuid, project_id, sort_order, title, notes, status, created_at, updated_at,
-              completed_at, sync_revision, sync_dirty
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+              completed_at, sync_revision, sync_dirty, reviewed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(uuid) DO UPDATE SET
               project_id = excluded.project_id,
               sort_order = excluded.sort_order,
@@ -1630,7 +1701,8 @@ impl Storage {
               updated_at = excluded.updated_at,
               completed_at = excluded.completed_at,
               sync_revision = excluded.sync_revision,
-              sync_dirty = excluded.sync_dirty
+              sync_dirty = excluded.sync_dirty,
+              reviewed_at = excluded.reviewed_at
             ",
             params![
                 task.uuid,
@@ -1643,7 +1715,8 @@ impl Storage {
                 task.updated_at,
                 task.completed_at,
                 task.sync_revision,
-                if task.sync_dirty { 1 } else { 0 }
+                if task.sync_dirty { 1 } else { 0 },
+                task.reviewed_at
             ],
         )?;
         Ok(())
@@ -1840,7 +1913,19 @@ fn database_path_from(
 }
 
 fn now_timestamp() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    format_timestamp(Utc::now())
+}
+
+/// Timestamp before which pending tasks are due for review.
+pub fn review_cutoff(days: i64) -> Result<String, AppError> {
+    TimeDelta::try_days(days)
+        .and_then(|delta| Utc::now().checked_sub_signed(delta))
+        .map(format_timestamp)
+        .ok_or_else(|| AppError::User(format!("Review days out of range: {days}")))
+}
+
+fn format_timestamp(timestamp: DateTime<Utc>) -> String {
+    timestamp.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
@@ -1881,6 +1966,7 @@ fn sync_task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncTask> {
         completed_at: row.get(8)?,
         sync_revision: row.get(9)?,
         sync_dirty: row.get::<_, i64>(10)? != 0,
+        reviewed_at: row.get(11)?,
     })
 }
 
@@ -1925,6 +2011,7 @@ fn sync_task_contents_equal(left: &SyncTask, right: &SyncTask) -> bool {
         && left.created_at == right.created_at
         && left.updated_at == right.updated_at
         && left.completed_at == right.completed_at
+        && left.reviewed_at == right.reviewed_at
 }
 
 fn sync_tombstone_contents_equal(left: &SyncTombstone, right: &SyncTombstone) -> bool {
@@ -1965,6 +2052,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
         completed_at: row.get(10)?,
+        reviewed_at: row.get(11)?,
     })
 }
 
@@ -2093,6 +2181,173 @@ mod tests {
 
         let inbox = storage.find_project("inbox").expect("find inbox");
         assert_eq!(inbox.expect("inbox exists").name, INBOX);
+    }
+
+    #[test]
+    fn opening_v3_database_backfills_reviewed_at_from_created_at() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("tasks.db");
+        let conn = Connection::open(&path).expect("open v3 database");
+        conn.execute_batch(
+            "
+            CREATE TABLE projects (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              uuid TEXT NOT NULL UNIQUE,
+              name TEXT NOT NULL,
+              name_normalized TEXT NOT NULL UNIQUE,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              archived_at TEXT,
+              sync_revision INTEGER NOT NULL DEFAULT 0,
+              sync_dirty INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE tasks (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              uuid TEXT NOT NULL UNIQUE,
+              project_id INTEGER NOT NULL REFERENCES projects(id),
+              sort_order INTEGER NOT NULL,
+              title TEXT NOT NULL,
+              notes TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL CHECK (status IN ('pending', 'done')),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              completed_at TEXT,
+              sync_revision INTEGER NOT NULL DEFAULT 0,
+              sync_dirty INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE sync_tombstones (
+              entity_type TEXT NOT NULL CHECK (entity_type IN ('project', 'task')),
+              uuid TEXT NOT NULL,
+              deleted_at TEXT NOT NULL,
+              sync_revision INTEGER NOT NULL DEFAULT 0,
+              sync_dirty INTEGER NOT NULL DEFAULT 1,
+              PRIMARY KEY (entity_type, uuid)
+            );
+            CREATE TABLE sync_state (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+            INSERT INTO sync_state (key, value) VALUES ('checkpoint', 3);
+            INSERT INTO projects (uuid, name, name_normalized, created_at, updated_at, sync_dirty)
+            VALUES ('p1', 'Home', 'home', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 0);
+            INSERT INTO tasks (
+              uuid, project_id, sort_order, title, status, created_at, updated_at, sync_dirty
+            )
+            VALUES ('t1', 1, 1, 'old task', 'pending', '2026-01-02T00:00:00Z',
+                    '2026-03-01T00:00:00Z', 0);
+            PRAGMA user_version = 3;
+            ",
+        )
+        .expect("create v3 schema");
+        drop(conn);
+
+        let storage = Storage::open(path).expect("open migrated storage");
+
+        let version: i64 = storage
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("user version");
+        assert_eq!(version, SCHEMA_VERSION);
+        let task = storage
+            .get_task_by_uuid("t1")
+            .expect("get task")
+            .expect("task");
+        assert_eq!(task.reviewed_at, "2026-01-02T00:00:00Z");
+        let dirty: i64 = storage
+            .conn
+            .query_row(
+                "SELECT sync_dirty FROM tasks WHERE uuid = 't1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sync dirty");
+        assert_eq!(dirty, 0);
+    }
+
+    #[test]
+    fn review_queries_include_all_inbox_tasks_and_stale_project_tasks() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage = Storage::open(dir.path().join("tasks.db")).expect("open storage");
+        let inbox = storage.add_task("inbox", "fresh inbox").expect("add");
+        storage.add_task("Home", "fresh home").expect("add");
+        let stale = storage.add_task("Work", "stale work").expect("add");
+        storage.add_task("Work", "fresh work").expect("add");
+        let done = storage.add_task("Errands", "stale done").expect("add");
+        storage.mark_done(done.id).expect("mark done");
+        storage
+            .conn
+            .execute(
+                "UPDATE tasks SET reviewed_at = '2026-01-01T00:00:00Z' WHERE id IN (?1, ?2)",
+                params![stale.id, done.id],
+            )
+            .expect("backdate");
+
+        let cutoff = "2026-01-01T00:00:00Z";
+        let projects = storage
+            .review_projects(cutoff)
+            .expect("review projects")
+            .into_iter()
+            .map(|project| project.name)
+            .collect::<Vec<_>>();
+        assert_eq!(projects, vec!["inbox".to_string(), "Work".to_string()]);
+
+        let inbox_project = storage.find_project("inbox").unwrap().unwrap();
+        let inbox_tasks = storage
+            .review_tasks_for_project(inbox_project.id, cutoff)
+            .expect("inbox tasks");
+        assert_eq!(inbox_tasks, vec![inbox]);
+        let work_tasks = storage
+            .review_tasks_for_project(stale.project_id, cutoff)
+            .expect("work tasks")
+            .into_iter()
+            .map(|task| task.title)
+            .collect::<Vec<_>>();
+        assert_eq!(work_tasks, vec!["stale work".to_string()]);
+    }
+
+    #[test]
+    fn mark_reviewed_updates_reviewed_at_and_syncs_to_other_clients() {
+        let first_dir = tempfile::tempdir().expect("first temp dir");
+        let second_dir = tempfile::tempdir().expect("second temp dir");
+        let server_dir = tempfile::tempdir().expect("server temp dir");
+        let first = Storage::open(first_dir.path().join("tasks.db")).expect("open first");
+        let second = Storage::open(second_dir.path().join("tasks.db")).expect("open second");
+        let server = Storage::open(server_dir.path().join("tasks.db")).expect("open server");
+        let sync = |client: &Storage| {
+            let request = client.export_sync_request().expect("export");
+            let response = server.apply_server_sync(&request).expect("server sync");
+            client
+                .apply_sync_response(&request, &response)
+                .expect("apply response");
+        };
+
+        let task = first.add_task("Home", "fix light").expect("add");
+        first
+            .conn
+            .execute(
+                "UPDATE tasks SET reviewed_at = '2026-01-01T00:00:00Z' WHERE id = ?1",
+                params![task.id],
+            )
+            .expect("backdate");
+        sync(&first);
+        sync(&second);
+        let synced = second.get_task_by_uuid(&task.uuid).unwrap().unwrap();
+        assert_eq!(synced.reviewed_at, "2026-01-01T00:00:00Z");
+
+        let reviewed = first
+            .mark_reviewed(task.id)
+            .expect("mark reviewed")
+            .expect("task");
+        assert_ne!(reviewed.reviewed_at, "2026-01-01T00:00:00Z");
+        assert_eq!(reviewed.updated_at, task.updated_at);
+        assert!(
+            first
+                .sync_task_by_uuid(&task.uuid)
+                .unwrap()
+                .unwrap()
+                .sync_dirty
+        );
+        sync(&first);
+        sync(&second);
+        let synced = second.get_task_by_uuid(&task.uuid).unwrap().unwrap();
+        assert_eq!(synced.reviewed_at, reviewed.reviewed_at);
     }
 
     #[test]
@@ -2935,6 +3190,7 @@ mod tests {
             completed_at: None,
             sync_revision: 0,
             sync_dirty: true,
+            reviewed_at: now_timestamp(),
         });
         let response = server
             .apply_server_sync(&stale)
@@ -2987,6 +3243,7 @@ mod tests {
             completed_at: None,
             sync_revision: 0,
             sync_dirty: true,
+            reviewed_at: now_timestamp(),
         });
 
         let error = server.apply_server_sync(&request).unwrap_err();
@@ -3130,6 +3387,7 @@ mod tests {
             completed_at: None,
             sync_revision: 0,
             sync_dirty: true,
+            reviewed_at: now_timestamp(),
         });
         assert!(matches!(
             storage.apply_server_sync(&invalid_status),
@@ -3158,6 +3416,7 @@ mod tests {
             completed_at: None,
             sync_revision: 0,
             sync_dirty: true,
+            reviewed_at: now_timestamp(),
         });
         assert!(matches!(
             storage.apply_server_sync(&invalid_position),
@@ -3194,6 +3453,7 @@ mod tests {
                 completed_at: None,
                 sync_revision: 2,
                 sync_dirty: false,
+                reviewed_at: now.clone(),
             }],
             tombstones: Vec::new(),
         };

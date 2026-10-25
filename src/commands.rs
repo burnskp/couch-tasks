@@ -5,11 +5,12 @@ use uuid::Uuid;
 use crate::{
     cli,
     cli::CliCommand,
+    config::ReviewMode,
     editor,
     error::AppError,
     models::{Task, TaskStatus},
-    output,
-    storage::Storage,
+    output, review,
+    storage::{self, Storage},
     sync_client::{self, SyncClientConfig},
 };
 
@@ -85,6 +86,18 @@ pub fn dispatch(command: CliCommand) -> Result<(), AppError> {
             let storage = Storage::open_default()?;
             show(&storage, id)
         }
+        CliCommand::Review { days, mode } => {
+            let mode = ReviewMode::resolve(mode)?;
+            let cutoff = storage::review_cutoff(days.unwrap_or(DEFAULT_REVIEW_DAYS))?;
+            let storage = Storage::open_default()?;
+            review::run(
+                &storage,
+                mode,
+                &cutoff,
+                io::stdin().lock(),
+                io::stdout().lock(),
+            )
+        }
         CliCommand::Sync {
             url,
             cert,
@@ -101,6 +114,8 @@ pub fn dispatch(command: CliCommand) -> Result<(), AppError> {
         }
     }
 }
+
+const DEFAULT_REVIEW_DAYS: i64 = 7;
 
 fn add(storage: &Storage, project: &str, title: &str) -> Result<(), AppError> {
     let task = storage.add_task(project, title)?;

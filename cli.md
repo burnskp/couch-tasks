@@ -112,6 +112,66 @@ Edit the project, single-line title, or notes, keeping the section headings.
 Save and close the editor to apply the changes. Use `done` and `undone` to change
 status; editing the `Status` line does not change it.
 
+## Review tasks
+
+```sh
+ct review
+ct review --days 14
+ct review --list
+```
+
+`review` walks through pending tasks project by project, `inbox` first. Every
+task records when it was last reviewed, starting from when it was created. A
+project's tasks come up for review once they have not been reviewed for 7 days
+(change this with `--days N`; `--days 0` reviews everything). Every pending
+`inbox` task is always included, regardless of when it was last reviewed.
+
+By default, review shows one task at a time. Type a key and press Enter:
+
+| Key          | Action                                        |
+| ------------ | --------------------------------------------- |
+| `k` or Enter | Keep the task and mark it reviewed            |
+| `d`          | Mark the task done                            |
+| `x`          | Delete the task (asks for confirmation)       |
+| `m`          | Move the task; prompts for the project name   |
+| `e`          | Edit the task in `$EDITOR`                    |
+| `s`          | Skip the task without marking it reviewed     |
+| `q`          | Quit the review                               |
+
+With `--list`, each project is shown as a numbered list and the `review>` prompt
+accepts commands. Numbers refer to that list, which is reprinted after each
+change; they do not affect the IDs from `ct list`.
+
+| Command           | Action                                                  |
+| ----------------- | ------------------------------------------------------- |
+| Enter or `r`      | Mark the remaining tasks reviewed and go to next project |
+| `k <n...>`        | Keep tasks and mark them reviewed                       |
+| `d <n...>`        | Mark tasks done                                         |
+| `x <n...>`        | Delete tasks                                            |
+| `m <n> <project>` | Move a task to another project                          |
+| `e <n>`           | Edit a task in `$EDITOR`                                |
+| `s`               | Skip the rest of this project                           |
+| `q`               | Quit the review                                         |
+
+Moved and edited tasks are marked reviewed. Quitting or reaching end of input
+keeps the changes made so far and leaves unreviewed tasks for the next review.
+`ct show` displays a task's last review date.
+
+To make list mode the default, set `CT_REVIEW_MODE=list` or add a `review`
+section to `~/.config/couch-tasks/config.json` (or
+`$XDG_CONFIG_HOME/couch-tasks/config.json`):
+
+```json
+{
+  "review": {
+    "mode": "list"
+  }
+}
+```
+
+The mode is chosen from `--tasks`/`--list`, then `CT_REVIEW_MODE`, then the
+config file, falling back to `task`. Review dates sync between devices.
+
 ## Sync between devices
 
 After [configuring sync](docs/sync.md), run `ct sync` on each device to send and

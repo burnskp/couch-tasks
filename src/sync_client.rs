@@ -10,9 +10,12 @@ use std::{
 use reqwest::{Certificate, Identity, blocking::Client};
 use serde::Deserialize;
 
-use crate::{error::AppError, storage::Storage};
+use crate::{
+    config::{ClientConfigFile, client_config_path},
+    error::AppError,
+    storage::Storage,
+};
 
-const CONFIG_FILE_NAME: &str = "config.json";
 const DEFAULT_CLIENT_CERT: &str = "client.crt";
 const DEFAULT_CLIENT_KEY: &str = "client.key";
 const DEFAULT_SERVER_CA: &str = "server-ca.crt";
@@ -37,8 +40,7 @@ impl SyncClientConfig {
         ca: Option<String>,
     ) -> Result<Self, AppError> {
         let home_dir = dirs::home_dir();
-        let config_path =
-            client_config_path_from(env::var_os("XDG_CONFIG_HOME").as_deref(), home_dir.clone())?;
+        let config_path = client_config_path()?;
         let data_dir =
             client_data_dir_from(env::var_os("XDG_DATA_HOME").as_deref(), home_dir.clone())?;
         let file_config = ClientConfigFile::load_optional(&config_path)?;
@@ -85,28 +87,7 @@ impl SyncClientConfig {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-struct ClientConfigFile {
-    #[serde(default)]
-    sync: Option<SyncConfigFile>,
-}
-
-impl ClientConfigFile {
-    fn load_optional(path: &Path) -> Result<Self, AppError> {
-        match fs::read_to_string(path) {
-            Ok(contents) => serde_json::from_str(&contents).map_err(|error| {
-                AppError::User(format!("Invalid client config {}: {error}", path.display()))
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(error) => Err(AppError::User(format!(
-                "Could not read client config {}: {error}",
-                path.display()
-            ))),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-struct SyncConfigFile {
+pub(crate) struct SyncConfigFile {
     url: Option<String>,
     cert: Option<String>,
     key: Option<String>,
@@ -218,25 +199,6 @@ fn sync_error(error: impl Error) -> AppError {
     AppError::Sync(message)
 }
 
-fn client_config_path_from(
-    xdg_config_home: Option<&OsStr>,
-    home_dir: Option<PathBuf>,
-) -> Result<PathBuf, AppError> {
-    if let Some(path) = xdg_config_home.filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(path)
-            .join("couch-tasks")
-            .join(CONFIG_FILE_NAME));
-    }
-
-    let home = home_dir.ok_or_else(|| {
-        AppError::User("could not determine home directory for client config path".to_string())
-    })?;
-    Ok(home
-        .join(".config")
-        .join("couch-tasks")
-        .join(CONFIG_FILE_NAME))
-}
-
 fn client_data_dir_from(
     xdg_data_home: Option<&OsStr>,
     home_dir: Option<PathBuf>,
@@ -279,6 +241,7 @@ mod tests {
     use std::{error::Error, fmt};
 
     use super::*;
+    use crate::config::CONFIG_FILE_NAME;
 
     #[test]
     fn sync_urls_require_https_and_preserve_base_paths() {
@@ -465,38 +428,9 @@ mod tests {
     }
 
     #[test]
-    fn malformed_config_file_is_user_error() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join(CONFIG_FILE_NAME);
-        fs::write(&path, "not json").expect("write config");
-
-        let error = ClientConfigFile::load_optional(&path).unwrap_err();
-
-        assert!(error.to_string().contains("Invalid client config"));
-        assert!(
-            error
-                .to_string()
-                .contains(path.to_str().expect("utf8 path"))
-        );
-    }
-
-    #[test]
-    fn path_helpers_use_xdg_then_home_fallbacks() {
+    fn data_dir_uses_xdg_then_home_fallback() {
         let home = PathBuf::from("/home/alice");
 
-        assert_eq!(
-            client_config_path_from(Some(OsStr::new("/tmp/config")), Some(home.clone()))
-                .expect("config path"),
-            PathBuf::from("/tmp/config")
-                .join("couch-tasks")
-                .join(CONFIG_FILE_NAME)
-        );
-        assert_eq!(
-            client_config_path_from(None, Some(home.clone())).expect("config path"),
-            home.join(".config")
-                .join("couch-tasks")
-                .join(CONFIG_FILE_NAME)
-        );
         assert_eq!(
             client_data_dir_from(Some(OsStr::new("/tmp/data")), Some(home.clone()))
                 .expect("data path"),

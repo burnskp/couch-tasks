@@ -34,7 +34,8 @@
       "updated_at": "2026-04-27T10:04:00Z",
       "completed_at": null,
       "sync_revision": 0,
-      "sync_dirty": true
+      "sync_dirty": true,
+      "reviewed_at": "2026-04-27T10:03:00Z"
     },
     {
       "uuid": "44444444-4444-4444-8444-444444444444",
@@ -47,7 +48,8 @@
       "updated_at": "2026-04-27T09:30:00Z",
       "completed_at": "2026-04-27T09:30:00Z",
       "sync_revision": 6,
-      "sync_dirty": false
+      "sync_dirty": false,
+      "reviewed_at": "2026-04-27T09:00:00Z"
     }
   ],
   "tombstones": [

@@ -112,6 +112,10 @@ pub fn format_task_details_with_id(task: &Task, id: &str) -> String {
         escape_terminal(&task.project_name),
         escape_terminal(&task.title)
     );
+    output.push_str(&format!(
+        "Reviewed: {}\n",
+        escape_terminal(format_date(&task.reviewed_at))
+    ));
 
     if task.notes.trim().is_empty() {
         output.push_str("\nNotes:\nNo notes.\n");
@@ -196,6 +200,11 @@ fn format_task_table_with_ids(tasks: &[Task], ids: &[String], show_notes: bool) 
     output
 }
 
+/// Date portion of an RFC 3339 timestamp.
+pub fn format_date(timestamp: &str) -> &str {
+    timestamp.get(..10).unwrap_or(timestamp)
+}
+
 fn has_notes(task: &Task) -> bool {
     !task.notes.trim().is_empty()
 }
@@ -223,6 +232,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             completed_at: None,
+            reviewed_at: String::new(),
         }
     }
 

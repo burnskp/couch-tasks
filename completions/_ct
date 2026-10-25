@@ -15,6 +15,7 @@ _ct_commands=(
   'edit:Edit a task in $EDITOR'
   'note:Append a note to a task'
   'show:Show task details'
+  'review:Review tasks project by project'
   'sync:Sync tasks'
 )
 
@@ -89,6 +90,12 @@ _ct() {
           ;;
         quick)
           _message 'task title'
+          ;;
+        review)
+          _arguments \
+            '--days[review tasks not reviewed in this many days]:days:' \
+            '(--list)--tasks[review one task at a time]' \
+            '(--tasks)--list[review each project as a numbered list]'
           ;;
         sync)
           _arguments \

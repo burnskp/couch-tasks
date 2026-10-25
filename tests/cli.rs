@@ -29,6 +29,12 @@ impl TestApp {
     }
 }
 
+/// Expected `ct show` output for a task reviewed today.
+fn show_output(header: &str, notes: &str) -> String {
+    let today = chrono::Utc::now().format("%Y-%m-%d");
+    format!("{header}\nReviewed: {today}\n\nNotes:\n{notes}\n")
+}
+
 #[test]
 fn binary_exposes_help() {
     let app = TestApp::new();
@@ -698,7 +704,7 @@ fn update_changes_task_fields_without_editor() {
         .args(["show", "1"])
         .assert()
         .success()
-        .stdout("1  Home  replace air filter\n\nNotes:\nCheck size.\n");
+        .stdout(show_output("1  Home  replace air filter", "Check size."));
 }
 
 #[test]
@@ -725,7 +731,7 @@ fn update_can_clear_notes_and_rejects_missing_tasks() {
         .args(["show", "1"])
         .assert()
         .success()
-        .stdout("1  inbox  buy milk\n\nNotes:\nNo notes.\n");
+        .stdout(show_output("1  inbox  buy milk", "No notes."));
 
     app.command()
         .args(["update", "99", "--title", "missing"])
@@ -876,7 +882,7 @@ fn free_form_task_text_can_contain_help_flags() {
         .args(["show", "1"])
         .assert()
         .success()
-        .stdout("1  inbox  read --help output\n\nNotes:\ncheck -h flag\n");
+        .stdout(show_output("1  inbox  read --help output", "check -h flag"));
 }
 
 #[test]
@@ -905,7 +911,7 @@ fn note_appends_without_changing_list_output() {
         .args(["show", "1"])
         .assert()
         .success()
-        .stdout("1  inbox  buy milk\n\nNotes:\ncheck coupon\n");
+        .stdout(show_output("1  inbox  buy milk", "check coupon"));
 
     app.command()
         .args(["list", "--notes"])
@@ -1102,11 +1108,13 @@ fn terminal_controls_are_escaped_but_machine_data_is_preserved() {
         .args(["show", "1"])
         .assert()
         .success()
-        .stdout(format!(
-            "1  {}  {}\n\nNotes:\n{}\n",
-            escape_terminal(project),
-            escape_terminal(title),
-            escape_terminal_multiline(notes)
+        .stdout(show_output(
+            &format!(
+                "1  {}  {}",
+                escape_terminal(project),
+                escape_terminal(title)
+            ),
+            &escape_terminal_multiline(notes),
         ));
     app.command()
         .args(["list", "--notes"])
@@ -1144,4 +1152,143 @@ fn terminal_controls_are_escaped_but_machine_data_is_preserved() {
         .assert()
         .success()
         .stdout(format!("Removed 1: {}\n", escape_terminal(title)));
+}
+
+impl TestApp {
+    fn review(&self) -> assert_cmd::Command {
+        let mut cmd = self.command();
+        cmd.arg("review")
+            .env("XDG_CONFIG_HOME", self._dir.path().join("config"))
+            .env_remove("CT_REVIEW_MODE");
+        assert_cmd::Command::from_std(cmd)
+    }
+
+    fn write_review_config(&self, mode: &str) {
+        let dir = self._dir.path().join("config").join("couch-tasks");
+        fs::create_dir_all(&dir).expect("create config dir");
+        fs::write(
+            dir.join("config.json"),
+            format!(r#"{{"review": {{"mode": "{mode}"}}}}"#),
+        )
+        .expect("write config");
+    }
+
+    fn pending_json(&self) -> serde_json::Value {
+        let output = self
+            .command()
+            .args(["list", "--json"])
+            .output()
+            .expect("list json");
+        serde_json::from_slice(&output.stdout).expect("parse list json")
+    }
+}
+
+#[test]
+fn review_reports_nothing_when_inbox_is_empty_and_projects_are_fresh() {
+    let app = TestApp::new();
+    app.command()
+        .args(["add", "Home", "fix light"])
+        .assert()
+        .success();
+
+    app.review()
+        .write_stdin("")
+        .assert()
+        .success()
+        .stdout("Nothing to review.\n");
+}
+
+#[test]
+fn review_defaults_to_task_by_task_mode() {
+    let app = TestApp::new();
+    app.command().args(["quick", "buy milk"]).assert().success();
+    app.command()
+        .args(["quick", "fix light"])
+        .assert()
+        .success();
+    app.command().args(["quick", "old idea"]).assert().success();
+    app.command()
+        .args(["add", "Home", "fresh task"])
+        .assert()
+        .success();
+
+    app.review()
+        .write_stdin("d\nm\nHome\nx\ny\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("== inbox (3 to review) =="))
+        .stdout(predicate::str::contains("Done: buy milk"))
+        .stdout(predicate::str::contains("Moved to Home: fix light"))
+        .stdout(predicate::str::contains("Removed: old idea"))
+        .stdout(predicate::str::contains("fresh task").not())
+        .stdout(predicate::str::contains(
+            "Reviewed 0, done 1, deleted 1, moved 1.",
+        ));
+
+    let pending = app.pending_json();
+    let pending = pending.as_array().expect("array");
+    assert_eq!(pending.len(), 2);
+    assert!(pending.iter().all(|task| task["project_name"] == "Home"));
+}
+
+#[test]
+fn review_list_mode_reviews_projects_with_commands() {
+    let app = TestApp::new();
+    app.command().args(["quick", "buy milk"]).assert().success();
+    app.command()
+        .args(["quick", "fix light"])
+        .assert()
+        .success();
+    app.command()
+        .args(["add", "Home", "paint"])
+        .assert()
+        .success();
+
+    app.review()
+        .args(["--list", "--days", "0"])
+        .write_stdin("d 1\n\n\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("== inbox =="))
+        .stdout(predicate::str::contains("review> "))
+        .stdout(predicate::str::contains("Done: buy milk"))
+        .stdout(predicate::str::contains("== Home =="))
+        .stdout(predicate::str::contains(
+            "Reviewed 2, done 1, deleted 0, moved 0.",
+        ));
+}
+
+#[test]
+fn review_mode_comes_from_config_then_env_then_flag() {
+    let app = TestApp::new();
+    app.command().args(["quick", "buy milk"]).assert().success();
+    app.write_review_config("list");
+
+    app.review()
+        .write_stdin("q\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("review> "));
+
+    app.review()
+        .env("CT_REVIEW_MODE", "task")
+        .write_stdin("q\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("review> ").not())
+        .stdout(predicate::str::contains("[k]eep"));
+
+    app.review()
+        .arg("--tasks")
+        .write_stdin("q\n")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[k]eep"));
+
+    app.review()
+        .env("CT_REVIEW_MODE", "grid")
+        .write_stdin("q\n")
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("Invalid CT_REVIEW_MODE"));
 }

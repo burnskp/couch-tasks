@@ -1,6 +1,6 @@
 use clap::{Arg, ArgAction, Command};
 
-use crate::{error::AppError, output::escape_terminal};
+use crate::{config::ReviewMode, error::AppError, output::escape_terminal};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
@@ -60,6 +60,10 @@ pub enum CliCommand {
     Show {
         id: String,
     },
+    Review {
+        days: Option<i64>,
+        mode: Option<ReviewMode>,
+    },
     Sync {
         url: Option<String>,
         cert: Option<String>,
@@ -111,6 +115,7 @@ where
         "edit" => parse_edit(&args[1..]),
         "note" => parse_note(&args[1..]),
         "show" => parse_show(&args[1..]),
+        "review" => parse_review(&args[1..]),
         "sync" => parse_sync(&args[1..]),
         "_complete" => parse_complete(&args[1..]),
         unknown if unknown.starts_with('-') => Err(usage("ct [command]", "Invalid option")),
@@ -243,6 +248,28 @@ pub fn command() -> Command {
             Command::new("show")
                 .about("Show task details")
                 .arg(Arg::new("id").required(true)),
+        )
+        .subcommand(
+            Command::new("review")
+                .about("Review tasks project by project")
+                .arg(
+                    Arg::new("days")
+                        .long("days")
+                        .num_args(1)
+                        .help("Review tasks not reviewed in this many days [default: 7]"),
+                )
+                .arg(
+                    Arg::new("tasks")
+                        .long("tasks")
+                        .help("Review one task at a time")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("list")
+                        .long("list")
+                        .help("Review each project as a numbered list")
+                        .action(ArgAction::SetTrue),
+                ),
         )
         .subcommand(
             Command::new("sync")
@@ -514,6 +541,54 @@ fn parse_show(args: &[String]) -> Result<CliCommand, AppError> {
         }),
         _ => Err(usage("ct show <id>", "Invalid show arguments")),
     }
+}
+
+fn parse_review(args: &[String]) -> Result<CliCommand, AppError> {
+    let usage_text = "ct review [--days <days>] [--tasks | --list]";
+    let mut days = None;
+    let mut mode = None;
+    let mut index = 0;
+
+    while index < args.len() {
+        let flag = args[index].as_str();
+        match flag {
+            "--tasks" | "--list" => {
+                if mode.is_some() {
+                    return Err(usage(usage_text, "Choose only one of --tasks or --list"));
+                }
+                mode = Some(if flag == "--tasks" {
+                    ReviewMode::Task
+                } else {
+                    ReviewMode::List
+                });
+            }
+            "--days" => {
+                if days.is_some() {
+                    return Err(usage(usage_text, "Duplicate --days option"));
+                }
+                let Some(value) = args.get(index + 1) else {
+                    return Err(usage(usage_text, "Missing value for --days"));
+                };
+                let value = value
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|days| *days >= 0)
+                    .ok_or_else(|| usage(usage_text, &format!("Invalid review days: {value}")))?;
+                days = Some(value);
+                index += 1;
+            }
+            option if option.starts_with('-') => {
+                return Err(usage(
+                    usage_text,
+                    &format!("Invalid review option: {option}"),
+                ));
+            }
+            _ => return Err(usage(usage_text, "Invalid review arguments")),
+        }
+        index += 1;
+    }
+
+    Ok(CliCommand::Review { days, mode })
 }
 
 fn parse_sync(args: &[String]) -> Result<CliCommand, AppError> {
@@ -859,6 +934,48 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("Duplicate --title option"));
+    }
+
+    #[test]
+    fn parses_review_options() {
+        assert_eq!(
+            parse(&["review"]).unwrap(),
+            CliCommand::Review {
+                days: None,
+                mode: None
+            }
+        );
+        assert_eq!(
+            parse(&["review", "--days", "0", "--list"]).unwrap(),
+            CliCommand::Review {
+                days: Some(0),
+                mode: Some(ReviewMode::List)
+            }
+        );
+        assert_eq!(
+            parse(&["review", "--tasks", "--days", "14"]).unwrap(),
+            CliCommand::Review {
+                days: Some(14),
+                mode: Some(ReviewMode::Task)
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_review_options() {
+        let error = parse(&["review", "--tasks", "--list"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Choose only one of --tasks or --list"));
+
+        let error = parse(&["review", "--days", "-1"]).unwrap_err().to_string();
+        assert!(error.contains("Invalid review days: -1"));
+
+        let error = parse(&["review", "--days"]).unwrap_err().to_string();
+        assert!(error.contains("Missing value for --days"));
+
+        let error = parse(&["review", "Home"]).unwrap_err().to_string();
+        assert!(error.contains("Usage: ct review"));
     }
 
     #[test]

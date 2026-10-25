@@ -481,6 +481,7 @@ mod tests {
             completed_at: None,
             sync_revision: 0,
             sync_dirty: true,
+            reviewed_at: "2026-09-04T00:00:00Z".to_string(),
         });
         let (status, body) = sync(State(state), Extension(identity), Ok(Json(orphan)))
             .await
