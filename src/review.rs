@@ -361,7 +361,7 @@ fn format_task(task: &Task) -> String {
     }
     output.push_str(&format!(
         "  reviewed {}\n",
-        output::format_date(&task.reviewed_at)
+        escape_terminal(output::format_date(&task.reviewed_at))
     ));
     output
 }
@@ -405,6 +405,18 @@ mod tests {
     }
 
     const CUTOFF: &str = "2020-01-01T00:00:00Z";
+
+    #[test]
+    fn format_task_escapes_reviewed_at() {
+        let (_dir, storage) = storage();
+        let mut task = storage.add_task("Home", "task").expect("add");
+        task.reviewed_at = "2026-01-0é\u{1b}]0;title\u{7}".to_string();
+
+        let output = format_task(&task);
+
+        assert!(!output.contains('\u{1b}'), "{output:?}");
+        assert!(!output.contains('\u{7}'), "{output:?}");
+    }
 
     #[test]
     fn nothing_to_review_when_inbox_is_empty_and_projects_are_fresh() {

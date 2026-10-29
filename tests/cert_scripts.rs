@@ -115,6 +115,97 @@ fn bootstrap_rejects_partial_certificate_pairs() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn bootstrap_rejects_symlinked_certificate_material() {
+    let env = ScriptTestEnv::new();
+    fs::create_dir(&env.cert_dir).expect("cert dir");
+    let protected = env._dir.path().join("protected");
+    fs::write(&protected, "secret").expect("protected file");
+    fs::set_permissions(&protected, fs::Permissions::from_mode(0o600)).expect("chmod protected");
+    fs::write(env.cert_dir.join("server.key"), "not a real key").expect("server key");
+    std::os::unix::fs::symlink(&protected, env.cert_dir.join("server.crt"))
+        .expect("server cert symlink");
+
+    let output = env
+        .command("scripts/ct-sync-bootstrap-certs.sh")
+        .args(["--cert-dir", env.cert_dir.to_str().expect("utf8 path")])
+        .output()
+        .expect("run bootstrap script");
+
+    assert!(!output.status.success(), "bootstrap unexpectedly succeeded");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("is not a regular file"), "stderr: {stderr}");
+    assert_eq!(file_mode(&protected), 0o600);
+    assert_eq!(fs::read_to_string(&protected).expect("read"), "secret");
+}
+
+#[cfg(unix)]
+#[test]
+fn bootstrap_rejects_cert_dir_under_writable_parent() {
+    let env = ScriptTestEnv::new();
+    let shared = env._dir.path().join("shared");
+    fs::create_dir(&shared).expect("shared dir");
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).expect("chmod shared");
+    let cert_dir = shared.join("certs");
+
+    let output = env
+        .command("scripts/ct-sync-bootstrap-certs.sh")
+        .args(["--cert-dir", cert_dir.to_str().expect("utf8 path")])
+        .output()
+        .expect("run bootstrap script");
+
+    assert!(!output.status.success(), "bootstrap unexpectedly succeeded");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("must be owned by root"), "stderr: {stderr}");
+    assert!(!cert_dir.join("ca.key").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn client_cert_does_not_follow_existing_p12_symlink() {
+    let env = ScriptTestEnv::new();
+    assert_success(
+        "bootstrap",
+        &env.command("scripts/ct-sync-bootstrap-certs.sh")
+            .args(["--cert-dir", env.cert_dir.to_str().expect("utf8 path")])
+            .output()
+            .expect("run bootstrap script"),
+    );
+    let protected = env._dir.path().join("protected");
+    fs::write(&protected, "secret").expect("protected file");
+    let p12_out = env.cert_dir.join("bundle.p12");
+    std::os::unix::fs::symlink(&protected, &p12_out).expect("p12 symlink");
+    let password_file = env._dir.path().join("p12-password.txt");
+    fs::write(&password_file, "test-password\n").expect("write password file");
+
+    let output = env
+        .command("scripts/ct-sync-client-cert.sh")
+        .args([
+            "--cert-dir",
+            env.cert_dir.to_str().expect("utf8 path"),
+            "--cn",
+            "Alice Example",
+            "--p12-out",
+            p12_out.to_str().expect("utf8 path"),
+            "--p12-password-file",
+            password_file.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("run client cert script");
+
+    assert!(
+        !output.status.success(),
+        "client cert unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing to overwrite existing file"),
+        "{stderr}"
+    );
+    assert_eq!(fs::read_to_string(&protected).expect("read"), "secret");
+}
+
 #[test]
 fn client_cert_generates_sanitized_five_year_client_certificate() {
     let env = ScriptTestEnv::new();
@@ -144,6 +235,16 @@ fn client_cert_generates_sanitized_five_year_client_certificate() {
     assert!(client_key.is_file());
     assert!(client_cert.is_file());
     assert!(client_csr.is_file());
+    assert!(
+        fs::read_dir(&env.cert_dir)
+            .expect("read cert dir")
+            .all(|entry| !entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".ct-sync-client.")),
+        "staging directory left behind"
+    );
 
     #[cfg(unix)]
     {
@@ -294,6 +395,36 @@ fi
 exit 0
 "#,
     );
+    // Report directories owned by the unprivileged test user as root-owned so the scripts'
+    // trusted-directory checks run against real permission bits.
+    let stat = real_command("stat");
+    let uid = String::from_utf8(
+        Command::new(real_command("id"))
+            .arg("-u")
+            .output()
+            .expect("run id -u")
+            .stdout,
+    )
+    .expect("utf8 uid");
+    write_executable(
+        &mock_bin.join("stat"),
+        &format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+'{stat}' "$@" | sed 's/^{uid} /0 /'
+"#,
+            stat = stat.display(),
+            uid = uid.trim(),
+        ),
+    );
+}
+
+fn real_command(name: &str) -> PathBuf {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("{name} not found on PATH"))
 }
 
 fn write_executable(path: &Path, content: &str) {

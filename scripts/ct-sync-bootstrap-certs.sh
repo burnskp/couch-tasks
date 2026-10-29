@@ -107,6 +107,46 @@ join_by_comma() {
   echo "$*"
 }
 
+# Root-owned directories that only root can modify cannot have their entries swapped by
+# another user between our checks and the writes, chmods, and chowns that follow.
+require_trusted_ancestors() {
+  local path owner mode
+  path="$(realpath -e -- "$1")"
+  while [[ "$path" != / ]]; do
+    path="$(dirname -- "$path")"
+    read -r owner mode < <(stat -c '%u %a' -- "$path")
+    if [[ "$owner" -ne 0 ]] || { (( 8#$mode & 8#022 )) && ! (( 8#$mode & 8#1000 )); }; then
+      echo "refusing to use $1: parent directory $path must be owned by root and not writable by group or others" >&2
+      exit 1
+    fi
+  done
+}
+
+require_trusted_dir() {
+  local path owner mode
+  if [[ -L "$1" || ! -d "$1" ]]; then
+    echo "refusing to use $1: not a directory" >&2
+    exit 1
+  fi
+  require_trusted_ancestors "$1"
+  path="$(realpath -e -- "$1")"
+  read -r owner mode < <(stat -c '%u %a' -- "$path")
+  if [[ "$owner" -ne 0 ]] || (( 8#$mode & 8#022 )); then
+    echo "refusing to use $1: directory must be owned by root and not writable by group or others" >&2
+    exit 1
+  fi
+}
+
+require_regular_or_absent() {
+  local path
+  for path in "$@"; do
+    if [[ -L "$path" ]] || { [[ -e "$path" ]] && [[ ! -f "$path" ]]; }; then
+      echo "refusing to continue: $path is not a regular file" >&2
+      exit 1
+    fi
+  done
+}
+
 ensure_pair_state() {
   local key="$1"
   local cert="$2"
@@ -147,11 +187,21 @@ require_root
 require_command openssl
 require_command chmod
 require_command chown
+require_command dirname
 require_command id
 require_command mkdir
+require_command realpath
+require_command stat
 require_service_user
 
 mkdir -p "$cert_dir"
+if [[ -L "$cert_dir" ]]; then
+  echo "refusing to use $cert_dir: certificate directory must not be a symlink" >&2
+  exit 1
+fi
+require_trusted_ancestors "$cert_dir"
+set_directory_permissions
+require_trusted_dir "$cert_dir"
 
 ca_key="$cert_dir/ca.key"
 ca_cert="$cert_dir/ca.crt"
@@ -160,6 +210,7 @@ server_csr="$cert_dir/server.csr"
 server_cert="$cert_dir/server.crt"
 serial_file="$cert_dir/ca.srl"
 
+require_regular_or_absent "$ca_key" "$ca_cert" "$server_key" "$server_csr" "$server_cert" "$serial_file"
 ensure_pair_state "$ca_key" "$ca_cert" "CA"
 ensure_pair_state "$server_key" "$server_cert" "server"
 
@@ -217,8 +268,6 @@ else
   echo "Using existing server certificate in $cert_dir"
   set_server_permissions
 fi
-
-set_directory_permissions
 
 cat <<EOF
 Certificate bootstrap complete:

@@ -100,6 +100,63 @@ require_root() {
   fi
 }
 
+# Root-owned directories that only root can modify cannot have their entries swapped by
+# another user between our checks and the writes, chmods, and chowns that follow.
+require_trusted_ancestors() {
+  local path owner mode
+  path="$(realpath -e -- "$1")"
+  while [[ "$path" != / ]]; do
+    path="$(dirname -- "$path")"
+    read -r owner mode < <(stat -c '%u %a' -- "$path")
+    if [[ "$owner" -ne 0 ]] || { (( 8#$mode & 8#022 )) && ! (( 8#$mode & 8#1000 )); }; then
+      echo "refusing to use $1: parent directory $path must be owned by root and not writable by group or others" >&2
+      exit 1
+    fi
+  done
+}
+
+require_trusted_dir() {
+  local path owner mode
+  if [[ -L "$1" || ! -d "$1" ]]; then
+    echo "refusing to use $1: not a directory" >&2
+    exit 1
+  fi
+  require_trusted_ancestors "$1"
+  path="$(realpath -e -- "$1")"
+  read -r owner mode < <(stat -c '%u %a' -- "$path")
+  if [[ "$owner" -ne 0 ]] || (( 8#$mode & 8#022 )); then
+    echo "refusing to use $1: directory must be owned by root and not writable by group or others" >&2
+    exit 1
+  fi
+}
+
+require_regular_or_absent() {
+  local path
+  for path in "$@"; do
+    if [[ -L "$path" ]] || { [[ -e "$path" ]] && [[ ! -f "$path" ]]; }; then
+      echo "refusing to continue: $path is not a regular file" >&2
+      exit 1
+    fi
+  done
+}
+
+publish_file() {
+  local source="$1"
+  local destination="$2"
+
+  if [[ "$force" -eq 1 ]]; then
+    mv -f -T -- "$source" "$destination"
+    return
+  fi
+  # GNU mv -n renames with RENAME_NOREPLACE, so an existing entry (including a symlink)
+  # is never replaced or followed. A skipped move leaves the staged file behind.
+  mv -n -T -- "$source" "$destination" || true
+  if [[ -e "$source" ]]; then
+    echo "refusing to overwrite existing file: $destination" >&2
+    exit 1
+  fi
+}
+
 sanitize_filename() {
   printf '%s' "$1" \
     | tr '[:upper:]' '[:lower:]' \
@@ -109,8 +166,13 @@ sanitize_filename() {
 require_root
 require_command openssl
 require_command chmod
+require_command dirname
 require_command mkdir
+require_command mktemp
+require_command mv
+require_command realpath
 require_command sed
+require_command stat
 require_command tr
 
 if [[ -z "$client_cn" ]]; then
@@ -131,9 +193,13 @@ esac
 
 out_dir="${out_dir:-$cert_dir}"
 mkdir -p "$out_dir"
+require_trusted_dir "$cert_dir"
+require_trusted_dir "$out_dir"
 
 ca_key="$cert_dir/ca.key"
 ca_cert="$cert_dir/ca.crt"
+serial_file="$cert_dir/ca.srl"
+require_regular_or_absent "$ca_key" "$ca_cert" "$serial_file"
 
 if [[ ! -f "$ca_key" || ! -f "$ca_cert" ]]; then
   echo "missing CA key/certificate in $cert_dir; expected ca.key and ca.crt" >&2
@@ -150,6 +216,10 @@ client_key="$out_dir/client-$safe_name.key"
 client_csr="$out_dir/client-$safe_name.csr"
 client_cert="$out_dir/client-$safe_name.crt"
 client_p12="${p12_out:-$out_dir/client-$safe_name.p12}"
+p12_dir="$(dirname -- "$client_p12")"
+if [[ "$p12" -eq 1 ]]; then
+  require_trusted_dir "$p12_dir"
+fi
 
 if [[ -n "$p12_password_file" && ! -f "$p12_password_file" ]]; then
   echo "PKCS#12 password file does not exist: $p12_password_file" >&2
@@ -162,49 +232,73 @@ if [[ "$force" -ne 1 ]]; then
     output_paths+=("$client_p12")
   fi
   for path in "${output_paths[@]}"; do
-    if [[ -e "$path" ]]; then
+    if [[ -e "$path" || -L "$path" ]]; then
       echo "refusing to overwrite existing file: $path" >&2
       exit 1
     fi
   done
 fi
 
+umask 077
+stage="$(mktemp -d "$out_dir/.ct-sync-client.XXXXXX")"
+p12_stage=""
+cleanup() {
+  rm -rf -- "$stage"
+  if [[ -n "$p12_stage" ]]; then
+    rm -rf -- "$p12_stage"
+  fi
+}
+trap cleanup EXIT
+
+staged_key="$stage/client.key"
+staged_csr="$stage/client.csr"
+staged_cert="$stage/client.crt"
+
 echo "Generating client certificate for CN '$client_cn'"
 openssl req -newkey rsa:4096 -nodes \
-  -keyout "$client_key" \
-  -out "$client_csr" \
+  -keyout "$staged_key" \
+  -out "$staged_csr" \
   -subj "/CN=$client_cn" \
   -addext "basicConstraints=critical,CA:FALSE" \
   -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
   -addext "extendedKeyUsage=clientAuth"
 
 openssl x509 -req \
-  -in "$client_csr" \
+  -in "$staged_csr" \
   -CA "$ca_cert" \
   -CAkey "$ca_key" \
   -CAcreateserial \
-  -out "$client_cert" \
+  -out "$staged_cert" \
   -days "$days" \
   -copy_extensions copy
 
-chmod 0600 "$client_key"
-chmod 0644 "$client_csr" "$client_cert"
-[[ -e "$cert_dir/ca.srl" ]] && chmod 0600 "$cert_dir/ca.srl"
+chmod 0600 "$staged_key"
+chmod 0644 "$staged_csr" "$staged_cert"
+[[ -e "$serial_file" ]] && chmod 0600 "$serial_file"
 
 if [[ "$p12" -eq 1 ]]; then
   echo "Generating PKCS#12 client bundle: $client_p12"
+  p12_stage="$(mktemp -d "$p12_dir/.ct-sync-client.XXXXXX")"
+  staged_p12="$p12_stage/client.p12"
   p12_passout_args=()
   if [[ -n "$p12_password_file" ]]; then
     p12_passout_args=(-passout "file:$p12_password_file")
   fi
   openssl pkcs12 -export \
-    -in "$client_cert" \
-    -inkey "$client_key" \
+    -in "$staged_cert" \
+    -inkey "$staged_key" \
     -certfile "$ca_cert" \
     -name "couch-tasks-client" \
-    -out "$client_p12" \
+    -out "$staged_p12" \
     "${p12_passout_args[@]}"
-  chmod 0600 "$client_p12"
+  chmod 0600 "$staged_p12"
+fi
+
+publish_file "$staged_key" "$client_key"
+publish_file "$staged_csr" "$client_csr"
+publish_file "$staged_cert" "$client_cert"
+if [[ "$p12" -eq 1 ]]; then
+  publish_file "$staged_p12" "$client_p12"
 fi
 
 cat <<EOF

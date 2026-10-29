@@ -21,6 +21,9 @@ use crate::{
 
 const SCHEMA_VERSION: i64 = 4;
 const INBOX: &str = "inbox";
+/// Highest checkpoint a client may bootstrap a pristine server from. It leaves the server
+/// ample revision headroom and keeps revisions exactly representable as JSON numbers.
+const MAX_SYNC_CHECKPOINT: i64 = (1 << 53) - 1;
 
 pub struct Storage {
     conn: Connection,
@@ -34,6 +37,21 @@ struct VisibleIdMapping {
 }
 
 const VISIBLE_ID_MAPPING_VERSION: u8 = 1;
+
+/// Allocates increasing sync revisions within one server merge transaction.
+struct SyncRevisions {
+    last: i64,
+}
+
+impl SyncRevisions {
+    fn next(&mut self) -> Result<i64, AppError> {
+        self.last = self
+            .last
+            .checked_add(1)
+            .ok_or_else(|| AppError::StorageMessage("sync revision space exhausted".to_string()))?;
+        Ok(self.last)
+    }
+}
 
 impl Storage {
     pub fn open_default() -> Result<Self, AppError> {
@@ -844,6 +862,9 @@ impl Storage {
                 )));
             }
             let revision_floor = if bootstrap { request.checkpoint } else { 0 };
+            let mut revisions = SyncRevisions {
+                last: server_checkpoint.max(revision_floor),
+            };
             let mut project_map = HashMap::new();
             let mut forced_projects = HashSet::new();
             let mut forced_tasks = HashSet::new();
@@ -881,7 +902,7 @@ impl Storage {
                             let mut accepted = project.clone();
                             accepted.uuid = existing.uuid.clone();
                             accepted.sync_revision =
-                                self.next_sync_revision_after(revision_floor)?;
+                                revisions.next()?;
                             accepted.sync_dirty = false;
                             self.update_sync_project_by_uuid(&accepted)?;
                         }
@@ -892,7 +913,7 @@ impl Storage {
                     forced_projects.insert(existing.uuid);
                 } else {
                     let mut accepted = project.clone();
-                    accepted.sync_revision = self.next_sync_revision_after(revision_floor)?;
+                    accepted.sync_revision = revisions.next()?;
                     accepted.sync_dirty = false;
                     self.insert_sync_project(&accepted)?;
                     project_map.insert(project.uuid.clone(), Some(accepted.uuid));
@@ -917,7 +938,7 @@ impl Storage {
                         continue;
                     }
 
-                    let revision = self.next_sync_revision_after(revision_floor)?;
+                    let revision = revisions.next()?;
                     let mut accepted = tombstone.clone();
                     accepted.sync_revision = revision;
                     accepted.sync_dirty = false;
@@ -967,7 +988,7 @@ impl Storage {
                         self.tombstone_task_rejected_by_project(
                             &task.uuid,
                             &project_tombstone,
-                            revision_floor,
+                            &mut revisions,
                             &mut touched_projects,
                             &mut forced_tombstones,
                         )?;
@@ -987,7 +1008,7 @@ impl Storage {
                             self.tombstone_task_rejected_by_project(
                                 &task.uuid,
                                 &project_tombstone,
-                                revision_floor,
+                                &mut revisions,
                                 &mut touched_projects,
                                 &mut forced_tombstones,
                             )?;
@@ -1014,7 +1035,7 @@ impl Storage {
                     self.tombstone_task_rejected_by_project(
                         &task.uuid,
                         &project_tombstone,
-                        revision_floor,
+                        &mut revisions,
                         &mut touched_projects,
                         &mut forced_tombstones,
                     )?;
@@ -1037,12 +1058,12 @@ impl Storage {
                 }
                 let destination_id = self.project_id_by_uuid(&accepted.project_uuid)?;
                 touched_projects.insert(destination_id);
-                accepted.sync_revision = self.next_sync_revision_after(revision_floor)?;
+                accepted.sync_revision = revisions.next()?;
                 accepted.sync_dirty = false;
                 self.upsert_sync_task(&accepted)?;
             }
 
-            self.canonicalize_pending_sort_orders(&touched_projects, revision_floor)?;
+            self.canonicalize_pending_sort_orders(&touched_projects, &mut revisions)?;
             let checkpoint = self.max_sync_revision()?;
             self.set_sync_checkpoint(checkpoint)?;
             self.build_sync_response(
@@ -1059,6 +1080,12 @@ impl Storage {
         if request.checkpoint < 0 {
             return Err(AppError::SyncBadRequest(format!(
                 "checkpoint must not be negative: {}",
+                request.checkpoint
+            )));
+        }
+        if request.checkpoint > MAX_SYNC_CHECKPOINT {
+            return Err(AppError::SyncBadRequest(format!(
+                "checkpoint {} exceeds the maximum supported checkpoint {MAX_SYNC_CHECKPOINT}",
                 request.checkpoint
             )));
         }
@@ -1084,6 +1111,11 @@ impl Storage {
                     "duplicate project entity key: {}",
                     project.uuid
                 )));
+            }
+            validate_sync_timestamp("project", &project.uuid, "created_at", &project.created_at)?;
+            validate_sync_timestamp("project", &project.uuid, "updated_at", &project.updated_at)?;
+            if let Some(archived_at) = &project.archived_at {
+                validate_sync_timestamp("project", &project.uuid, "archived_at", archived_at)?;
             }
             if !project_names.insert(project.name_normalized.as_str()) {
                 return Err(AppError::SyncBadRequest(format!(
@@ -1130,6 +1162,12 @@ impl Storage {
                     )));
                 }
             }
+            validate_sync_timestamp("task", &task.uuid, "created_at", &task.created_at)?;
+            validate_sync_timestamp("task", &task.uuid, "updated_at", &task.updated_at)?;
+            validate_sync_timestamp("task", &task.uuid, "reviewed_at", &task.reviewed_at)?;
+            if let Some(completed_at) = &task.completed_at {
+                validate_sync_timestamp("task", &task.uuid, "completed_at", completed_at)?;
+            }
             if !entity_keys.insert((SyncEntityKind::Task.as_str(), task.uuid.as_str())) {
                 return Err(AppError::SyncBadRequest(format!(
                     "duplicate task entity key: {}",
@@ -1146,6 +1184,12 @@ impl Storage {
                     tombstone.uuid
                 )));
             }
+            validate_sync_timestamp(
+                tombstone.entity_type.as_str(),
+                &tombstone.uuid,
+                "deleted_at",
+                &tombstone.deleted_at,
+            )?;
             if !entity_keys.insert((tombstone.entity_type.as_str(), tombstone.uuid.as_str())) {
                 return Err(AppError::SyncBadRequest(format!(
                     "duplicate {} entity key: {}",
@@ -1166,8 +1210,12 @@ impl Storage {
         forced_tombstones: &HashSet<(&'static str, String)>,
     ) -> Result<SyncResponse, AppError> {
         let mut projects = self.sync_projects_since(request_checkpoint)?;
+        let mut included = projects
+            .iter()
+            .map(|project| project.uuid.clone())
+            .collect::<HashSet<_>>();
         for uuid in forced_projects {
-            if !projects.iter().any(|project| project.uuid == *uuid)
+            if included.insert(uuid.clone())
                 && let Some(project) = self.sync_project_by_uuid(uuid)?
             {
                 projects.push(project);
@@ -1182,8 +1230,12 @@ impl Storage {
         });
 
         let mut tasks = self.sync_tasks_since(request_checkpoint)?;
+        let mut included = tasks
+            .iter()
+            .map(|task| task.uuid.clone())
+            .collect::<HashSet<_>>();
         for uuid in forced_tasks {
-            if !tasks.iter().any(|task| task.uuid == *uuid)
+            if included.insert(uuid.clone())
                 && let Some(task) = self.sync_task_by_uuid(uuid)?
             {
                 tasks.push(task);
@@ -1205,10 +1257,12 @@ impl Storage {
         });
 
         let mut tombstones = self.sync_tombstones_since(request_checkpoint)?;
+        let mut included = tombstones
+            .iter()
+            .map(|tombstone| (tombstone.entity_type.as_str(), tombstone.uuid.clone()))
+            .collect::<HashSet<_>>();
         for (entity_type, uuid) in forced_tombstones {
-            if !tombstones.iter().any(|tombstone| {
-                tombstone.entity_type.as_str() == *entity_type && tombstone.uuid == *uuid
-            }) {
+            if included.insert((*entity_type, uuid.clone())) {
                 let entity_type =
                     SyncEntityKind::try_from(*entity_type).map_err(AppError::StorageMessage)?;
                 if let Some(tombstone) = self.sync_tombstone_by_key(entity_type, uuid)? {
@@ -1373,7 +1427,7 @@ impl Storage {
         &self,
         task_uuid: &str,
         project_tombstone: &SyncTombstone,
-        revision_floor: i64,
+        revisions: &mut SyncRevisions,
         touched_projects: &mut HashSet<i64>,
         forced_tombstones: &mut HashSet<(&'static str, String)>,
     ) -> Result<(), AppError> {
@@ -1386,7 +1440,7 @@ impl Storage {
             entity_type: SyncEntityKind::Task,
             uuid: task_uuid.to_string(),
             deleted_at: project_tombstone.deleted_at.clone(),
-            sync_revision: self.next_sync_revision_after(revision_floor)?,
+            sync_revision: revisions.next()?,
             sync_dirty: false,
         };
         self.apply_sync_tombstone(&task_tombstone)?;
@@ -1424,7 +1478,7 @@ impl Storage {
     fn canonicalize_pending_sort_orders(
         &self,
         project_ids: &HashSet<i64>,
-        revision_floor: i64,
+        revisions: &mut SyncRevisions,
     ) -> Result<(), AppError> {
         let mut project_ids = project_ids.iter().copied().collect::<Vec<_>>();
         project_ids.sort_unstable();
@@ -1447,7 +1501,7 @@ impl Storage {
             for (index, (task_id, current_order)) in tasks.into_iter().enumerate() {
                 let canonical_order = i64::try_from(index + 1).unwrap_or(i64::MAX);
                 if current_order != canonical_order {
-                    let revision = self.next_sync_revision_after(revision_floor)?;
+                    let revision = revisions.next()?;
                     self.conn.execute(
                         "
                         UPDATE tasks
@@ -1789,10 +1843,6 @@ impl Storage {
             .map_or(Ok(0), Ok)
     }
 
-    fn next_sync_revision_after(&self, floor: i64) -> Result<i64, AppError> {
-        Ok(self.max_sync_revision()?.max(floor) + 1)
-    }
-
     fn completed_task_tombstone_rows(
         &self,
         project_id: Option<i64>,
@@ -1922,6 +1972,21 @@ pub fn review_cutoff(days: i64) -> Result<String, AppError> {
         .and_then(|delta| Utc::now().checked_sub_signed(delta))
         .map(format_timestamp)
         .ok_or_else(|| AppError::User(format!("Review days out of range: {days}")))
+}
+
+fn validate_sync_timestamp(
+    entity: &str,
+    uuid: &str,
+    field: &str,
+    value: &str,
+) -> Result<(), AppError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|_| ())
+        .map_err(|_| {
+            AppError::SyncBadRequest(format!(
+                "{entity} {uuid} has an invalid {field} timestamp: {value:?}"
+            ))
+        })
 }
 
 fn format_timestamp(timestamp: DateTime<Utc>) -> String {
@@ -3422,6 +3487,126 @@ mod tests {
             storage.apply_server_sync(&invalid_position),
             Err(AppError::SyncBadRequest(_))
         ));
+
+        let mut oversized_checkpoint = storage.export_sync_request().expect("export checkpoint");
+        oversized_checkpoint.checkpoint = MAX_SYNC_CHECKPOINT + 1;
+        assert!(matches!(
+            storage.apply_server_sync(&oversized_checkpoint),
+            Err(AppError::SyncBadRequest(_))
+        ));
+
+        let mut invalid_timestamp = storage.export_sync_request().expect("export timestamp");
+        invalid_timestamp.tasks.push(SyncTask {
+            uuid: Uuid::new_v4().to_string(),
+            project_uuid: invalid_timestamp.projects[0].uuid.clone(),
+            sort_order: 1,
+            title: "invalid timestamp".to_string(),
+            notes: String::new(),
+            status: "pending".to_string(),
+            created_at: now_timestamp(),
+            updated_at: now_timestamp(),
+            completed_at: None,
+            sync_revision: 0,
+            sync_dirty: true,
+            reviewed_at: "2026-01-0é\u{1b}]0;title\u{7}".to_string(),
+        });
+        assert!(matches!(
+            storage.apply_server_sync(&invalid_timestamp),
+            Err(AppError::SyncBadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn sync_revisions_reject_overflow() {
+        let mut revisions = SyncRevisions { last: i64::MAX - 1 };
+        assert_eq!(revisions.next().expect("last revision"), i64::MAX);
+        assert!(matches!(revisions.next(), Err(AppError::StorageMessage(_))));
+    }
+
+    #[test]
+    fn exhausted_revision_space_rolls_back_server_sync() {
+        let client_dir = tempfile::tempdir().expect("client temp dir");
+        let server_dir = tempfile::tempdir().expect("server temp dir");
+        let client = Storage::open(client_dir.path().join("tasks.db")).expect("open client");
+        let server = Storage::open(server_dir.path().join("tasks.db")).expect("open server");
+        client.add_task("Work", "first").expect("add first task");
+        server
+            .apply_server_sync(&client.export_sync_request().expect("export first"))
+            .expect("first sync");
+        server
+            .conn
+            .execute("UPDATE tasks SET sync_revision = ?1", params![i64::MAX])
+            .expect("exhaust revisions");
+
+        let second = client.add_task("Work", "second").expect("add second task");
+        let error = server
+            .apply_server_sync(&client.export_sync_request().expect("export second"))
+            .unwrap_err();
+        assert!(matches!(error, AppError::StorageMessage(_)), "{error}");
+        assert_eq!(server.max_sync_revision().expect("max revision"), i64::MAX);
+        assert!(
+            server
+                .sync_task_by_uuid(&second.uuid)
+                .expect("lookup second")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn server_sync_allocates_unique_increasing_revisions() {
+        let client_dir = tempfile::tempdir().expect("client temp dir");
+        let server_dir = tempfile::tempdir().expect("server temp dir");
+        let client = Storage::open(client_dir.path().join("tasks.db")).expect("open client");
+        let server = Storage::open(server_dir.path().join("tasks.db")).expect("open server");
+        for index in 0..20 {
+            client
+                .add_task(&format!("Project {}", index % 3), &format!("task {index}"))
+                .expect("add task");
+        }
+
+        let response = server
+            .apply_server_sync(&client.export_sync_request().expect("export request"))
+            .expect("server sync");
+        let mut revisions = response
+            .projects
+            .iter()
+            .map(|project| project.sync_revision)
+            .chain(response.tasks.iter().map(|task| task.sync_revision))
+            .collect::<Vec<_>>();
+        let count = revisions.len();
+        revisions.sort_unstable();
+        revisions.dedup();
+        assert_eq!(revisions.len(), count, "{response:#?}");
+        assert_eq!(revisions.last().copied(), Some(response.checkpoint));
+    }
+
+    #[test]
+    fn replayed_dirty_snapshot_returns_each_entity_once() {
+        let client_dir = tempfile::tempdir().expect("client temp dir");
+        let server_dir = tempfile::tempdir().expect("server temp dir");
+        let client = Storage::open(client_dir.path().join("tasks.db")).expect("open client");
+        let server = Storage::open(server_dir.path().join("tasks.db")).expect("open server");
+        client.add_task("Work", "keep").expect("add kept task");
+        let deleted = client.add_task("Work", "delete").expect("add deleted task");
+        client.delete_task(deleted.id).expect("delete task");
+        let request = client.export_sync_request().expect("export request");
+        server.apply_server_sync(&request).expect("first sync");
+
+        let replay = server.apply_server_sync(&request).expect("replay sync");
+        let task_uuids = replay
+            .tasks
+            .iter()
+            .map(|task| task.uuid.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(task_uuids.len(), replay.tasks.len(), "{replay:#?}");
+        assert_eq!(replay.tasks.len(), request.tasks.len());
+        let tombstone_keys = replay
+            .tombstones
+            .iter()
+            .map(|tombstone| (tombstone.entity_type.as_str(), tombstone.uuid.as_str()))
+            .collect::<HashSet<_>>();
+        assert_eq!(tombstone_keys.len(), replay.tombstones.len(), "{replay:#?}");
+        assert_eq!(replay.tombstones.len(), request.tombstones.len());
     }
 
     #[test]
