@@ -1,6 +1,11 @@
 use clap::{Arg, ArgAction, Command};
 
-use crate::{config::ReviewMode, error::AppError, output::escape_terminal};
+use crate::{
+    config::{DueFormat, ReviewMode},
+    due,
+    error::AppError,
+    output::escape_terminal,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
@@ -9,6 +14,8 @@ pub enum CliCommand {
         project: Option<String>,
         show_notes: bool,
         json: bool,
+        due_only: bool,
+        due_format: Option<DueFormat>,
     },
     Completed {
         project: Option<String>,
@@ -23,9 +30,13 @@ pub enum CliCommand {
     Add {
         project: String,
         title: String,
+        due: Option<String>,
+        remind: bool,
     },
     Quick {
         title: String,
+        due: Option<String>,
+        remind: bool,
     },
     Done {
         ids: Vec<String>,
@@ -45,6 +56,17 @@ pub enum CliCommand {
         project: Option<String>,
         title: Option<String>,
         notes: Option<String>,
+        due: Option<String>,
+        remind: Option<bool>,
+    },
+    Due {
+        ids: Vec<String>,
+        /// `None` clears the due date.
+        date: Option<String>,
+    },
+    Remind {
+        ids: Vec<String>,
+        on: bool,
     },
     Reorder {
         id: String,
@@ -111,6 +133,8 @@ where
         }),
         "move" => parse_move(&args[1..]),
         "update" => parse_update(&args[1..]),
+        "due" => parse_due(&args[1..]),
+        "remind" => parse_remind(&args[1..]),
         "reorder" => parse_reorder(&args[1..]),
         "edit" => parse_edit(&args[1..]),
         "note" => parse_note(&args[1..]),
@@ -123,6 +147,8 @@ where
             project: Some(args[0].clone()),
             show_notes: false,
             json: false,
+            due_only: false,
+            due_format: None,
         }),
         unknown => Err(AppError::User(format!(
             "Unknown command: {}\nUsage: ct [command]",
@@ -156,6 +182,24 @@ pub fn command() -> Command {
                         .help("Output pending tasks as JSON")
                         .action(ArgAction::SetTrue),
                 )
+                .arg(
+                    Arg::new("due")
+                        .long("due")
+                        .help("List only tasks with due dates, soonest first")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("absolute")
+                        .long("absolute")
+                        .help("Show due dates as local date and time")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("relative")
+                        .long("relative")
+                        .help("Show due dates as time remaining")
+                        .action(ArgAction::SetTrue),
+                )
                 .arg(project_arg()),
         )
         .subcommand(
@@ -185,12 +229,16 @@ pub fn command() -> Command {
         .subcommand(
             Command::new("add")
                 .about("Add a task to a project")
+                .arg(due_option_arg())
+                .arg(remind_flag_arg())
                 .arg(project_arg().required(true))
                 .arg(task_words_arg().required(true)),
         )
         .subcommand(
             Command::new("quick")
                 .about("Quick add a task to inbox")
+                .arg(due_option_arg())
+                .arg(remind_flag_arg())
                 .arg(task_words_arg().required(true)),
         )
         .subcommand(
@@ -220,7 +268,33 @@ pub fn command() -> Command {
                 .arg(Arg::new("id").required(true))
                 .arg(Arg::new("project").long("project").num_args(1))
                 .arg(Arg::new("title").long("title").num_args(1))
-                .arg(Arg::new("notes").long("notes").num_args(1)),
+                .arg(Arg::new("notes").long("notes").num_args(1))
+                .arg(due_option_arg().help("Set the due date; an empty value clears it"))
+                .arg(remind_flag_arg())
+                .arg(
+                    Arg::new("no-remind")
+                        .long("no-remind")
+                        .help("Turn the reminder off")
+                        .action(ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("due")
+                .about("Set or clear due dates")
+                .arg(ids_arg().required(true))
+                .arg(Arg::new("date").help(DUE_DATE_HELP))
+                .arg(
+                    Arg::new("clear")
+                        .long("clear")
+                        .help("Clear the due date and reminder")
+                        .action(ArgAction::SetTrue),
+                ),
+        )
+        .subcommand(
+            Command::new("remind")
+                .about("Turn reminders on or off")
+                .arg(ids_arg().required(true))
+                .arg(Arg::new("state").required(true).value_parser(["on", "off"])),
         )
         .subcommand(
             Command::new("reorder")
@@ -295,8 +369,11 @@ pub fn command() -> Command {
 }
 
 fn parse_list(args: &[String]) -> Result<CliCommand, AppError> {
+    let usage_text = "ct list [--notes] [--json] [--due] [--absolute | --relative] [project]";
     let mut show_notes = false;
     let mut json = false;
+    let mut due_only = false;
+    let mut due_format = None;
     let mut project = None;
 
     for arg in args {
@@ -304,18 +381,26 @@ fn parse_list(args: &[String]) -> Result<CliCommand, AppError> {
             show_notes = true;
         } else if arg == "--json" {
             json = true;
+        } else if arg == "--due" {
+            due_only = true;
+        } else if arg == "--absolute" || arg == "--relative" {
+            if due_format.is_some() {
+                return Err(usage(
+                    usage_text,
+                    "Choose only one of --absolute or --relative",
+                ));
+            }
+            due_format = Some(if arg == "--absolute" {
+                DueFormat::Absolute
+            } else {
+                DueFormat::Relative
+            });
         } else if arg.starts_with('-') {
-            return Err(usage(
-                "ct list [--notes] [--json] [project]",
-                "Invalid list option",
-            ));
+            return Err(usage(usage_text, "Invalid list option"));
         } else if project.is_none() && !arg.trim().is_empty() {
             project = Some(arg.clone());
         } else {
-            return Err(usage(
-                "ct list [--notes] [--json] [project]",
-                "Invalid list arguments",
-            ));
+            return Err(usage(usage_text, "Invalid list arguments"));
         }
     }
 
@@ -323,6 +408,8 @@ fn parse_list(args: &[String]) -> Result<CliCommand, AppError> {
         project,
         show_notes,
         json,
+        due_only,
+        due_format,
     })
 }
 
@@ -384,26 +471,72 @@ fn parse_clear_completed(args: &[String]) -> Result<CliCommand, AppError> {
 }
 
 fn parse_add(args: &[String]) -> Result<CliCommand, AppError> {
-    if args.len() < 2 {
-        return Err(usage("ct add <project> <task...>", "Missing add arguments"));
+    let usage_text = "ct add [--due <date>] [--remind] <project> <task...>";
+    let (words, due, remind) = parse_new_task_options(args, usage_text)?;
+    if words.len() < 2 {
+        return Err(usage(usage_text, "Missing add arguments"));
     }
 
-    let project = require_non_empty(
-        &args[0],
-        "ct add <project> <task...>",
-        "Project name cannot be empty",
-    )?;
-    let title = join_non_empty(
-        &args[1..],
-        "ct add <project> <task...>",
-        "Task title cannot be empty",
-    )?;
-    Ok(CliCommand::Add { project, title })
+    let project = require_non_empty(&words[0], usage_text, "Project name cannot be empty")?;
+    let title = join_non_empty(&words[1..], usage_text, "Task title cannot be empty")?;
+    Ok(CliCommand::Add {
+        project,
+        title,
+        due,
+        remind,
+    })
 }
 
 fn parse_quick(args: &[String]) -> Result<CliCommand, AppError> {
-    let title = join_non_empty(args, "ct quick <task...>", "Task title cannot be empty")?;
-    Ok(CliCommand::Quick { title })
+    let usage_text = "ct quick [--due <date>] [--remind] <task...>";
+    let (words, due, remind) = parse_new_task_options(args, usage_text)?;
+    let title = join_non_empty(&words, usage_text, "Task title cannot be empty")?;
+    Ok(CliCommand::Quick { title, due, remind })
+}
+
+/// Split `--due <date>` and `--remind` out of the words of a new task.
+fn parse_new_task_options(
+    args: &[String],
+    usage_text: &'static str,
+) -> Result<(Vec<String>, Option<String>, bool), AppError> {
+    let mut words = Vec::new();
+    let mut due = None;
+    let mut remind = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--due" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(usage(usage_text, "Missing value for --due"));
+                };
+                due = some_due_once(due, value, usage_text)?;
+                index += 1;
+            }
+            "--remind" => remind = true,
+            word => words.push(word.to_string()),
+        }
+        index += 1;
+    }
+
+    if remind && due.is_none() {
+        return Err(usage(usage_text, "--remind requires --due"));
+    }
+    Ok((words, due, remind))
+}
+
+fn some_due_once(
+    current: Option<String>,
+    value: &str,
+    usage_text: &'static str,
+) -> Result<Option<String>, AppError> {
+    if current.is_some() {
+        Err(usage(usage_text, "Duplicate --due option"))
+    } else if value.trim().is_empty() {
+        Err(usage(usage_text, "Due date cannot be empty"))
+    } else {
+        Ok(Some(value.to_string()))
+    }
 }
 
 fn parse_ids_command(
@@ -433,7 +566,7 @@ fn parse_move(args: &[String]) -> Result<CliCommand, AppError> {
 }
 
 fn parse_update(args: &[String]) -> Result<CliCommand, AppError> {
-    let usage_text = "ct update <id> [--project <project>] [--title <title>] [--notes <notes>]";
+    let usage_text = "ct update <id> [--project <project>] [--title <title>] [--notes <notes>] [--due <date>] [--remind | --no-remind]";
     let Some(id) = args.first() else {
         return Err(usage(usage_text, "Missing task ID"));
     };
@@ -442,10 +575,24 @@ fn parse_update(args: &[String]) -> Result<CliCommand, AppError> {
     let mut project = None;
     let mut title = None;
     let mut notes = None;
+    let mut due = None;
+    let mut remind = None;
     let mut index = 1;
 
     while index < args.len() {
         let flag = args[index].as_str();
+        if flag == "--remind" || flag == "--no-remind" {
+            if remind.is_some() {
+                return Err(usage(
+                    usage_text,
+                    "Choose only one of --remind or --no-remind",
+                ));
+            }
+            remind = Some(flag == "--remind");
+            index += 1;
+            continue;
+        }
+
         let Some(value) = args.get(index + 1) else {
             return Err(usage(usage_text, &format!("Missing value for {flag}")));
         };
@@ -477,6 +624,12 @@ fn parse_update(args: &[String]) -> Result<CliCommand, AppError> {
                 }
                 notes = Some(value.to_string());
             }
+            "--due" => {
+                if due.is_some() {
+                    return Err(usage(usage_text, "Duplicate --due option"));
+                }
+                due = Some(value.trim().to_string());
+            }
             option if option.starts_with('-') => {
                 return Err(usage(
                     usage_text,
@@ -489,8 +642,15 @@ fn parse_update(args: &[String]) -> Result<CliCommand, AppError> {
         index += 2;
     }
 
-    if project.is_none() && title.is_none() && notes.is_none() {
+    if project.is_none() && title.is_none() && notes.is_none() && due.is_none() && remind.is_none()
+    {
         return Err(usage(usage_text, "No updates specified"));
+    }
+    if remind == Some(true) && due.as_deref() == Some("") {
+        return Err(usage(
+            usage_text,
+            "--remind cannot be used when clearing --due",
+        ));
     }
 
     Ok(CliCommand::Update {
@@ -498,6 +658,69 @@ fn parse_update(args: &[String]) -> Result<CliCommand, AppError> {
         project,
         title,
         notes,
+        due,
+        remind,
+    })
+}
+
+fn parse_due(args: &[String]) -> Result<CliCommand, AppError> {
+    let usage_text = "ct due <id...> <date> [HH:MM] | ct due <id...> --clear";
+    let clear = args.iter().any(|arg| arg == "--clear");
+    let mut positional = args
+        .iter()
+        .filter(|arg| arg.as_str() != "--clear")
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if clear {
+        if args.iter().filter(|arg| arg.as_str() == "--clear").count() > 1 {
+            return Err(usage(usage_text, "Duplicate --clear option"));
+        }
+        if positional.is_empty() {
+            return Err(usage(usage_text, "Missing task ID"));
+        }
+        return Ok(CliCommand::Due {
+            ids: positional,
+            date: None,
+        });
+    }
+
+    // The date is the last argument, or the last two when it ends with a time.
+    let date_len = match positional.as_slice() {
+        [.., _, last] if due::is_due_time(last) && positional.len() >= 3 => 2,
+        _ => 1,
+    };
+    if positional.len() <= date_len {
+        return Err(usage(usage_text, "Missing task ID or due date"));
+    }
+    let date = positional.split_off(positional.len() - date_len).join(" ");
+    if date.trim().is_empty() {
+        return Err(usage(usage_text, "Due date cannot be empty"));
+    }
+
+    Ok(CliCommand::Due {
+        ids: positional,
+        date: Some(date),
+    })
+}
+
+fn parse_remind(args: &[String]) -> Result<CliCommand, AppError> {
+    let usage_text = "ct remind <id...> on|off";
+    let Some((state, ids)) = args.split_last() else {
+        return Err(usage(usage_text, "Missing task ID"));
+    };
+    let on = match state.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => return Err(usage(usage_text, "Expected on or off after the task IDs")),
+    };
+    if ids.is_empty() {
+        return Err(usage(usage_text, "Missing task ID"));
+    }
+
+    Ok(CliCommand::Remind {
+        ids: ids.to_vec(),
+        on,
     })
 }
 
@@ -726,6 +949,24 @@ fn ids_arg() -> Arg {
     Arg::new("ids").num_args(1..).action(ArgAction::Append)
 }
 
+const DUE_DATE_HELP: &str =
+    "YYYY-MM-DD, YY-MM-DD, MM-DD, DD, or <n>w<n>d, optionally followed by HH:MM";
+
+fn due_option_arg() -> Arg {
+    Arg::new("due")
+        .long("due")
+        .num_args(1)
+        .value_name("date")
+        .help(DUE_DATE_HELP)
+}
+
+fn remind_flag_arg() -> Arg {
+    Arg::new("remind")
+        .long("remind")
+        .help("Turn the reminder on (requires a due date)")
+        .action(ArgAction::SetTrue)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,7 +987,9 @@ mod tests {
             CliCommand::List {
                 project: Some("Home".to_string()),
                 show_notes: false,
-                json: false
+                json: false,
+                due_only: false,
+                due_format: None,
             }
         );
     }
@@ -758,7 +1001,9 @@ mod tests {
             CliCommand::List {
                 project: Some("Home".to_string()),
                 show_notes: true,
-                json: false
+                json: false,
+                due_only: false,
+                due_format: None,
             }
         );
     }
@@ -770,7 +1015,9 @@ mod tests {
             CliCommand::List {
                 project: Some("Home".to_string()),
                 show_notes: false,
-                json: true
+                json: true,
+                due_only: false,
+                due_format: None,
             }
         );
     }
@@ -809,7 +1056,9 @@ mod tests {
             parse(&["add", "Home", "fix", "garage", "light"]).unwrap(),
             CliCommand::Add {
                 project: "Home".to_string(),
-                title: "fix garage light".to_string()
+                title: "fix garage light".to_string(),
+                due: None,
+                remind: false,
             }
         );
     }
@@ -819,7 +1068,9 @@ mod tests {
         assert_eq!(
             parse(&["quick", "buy", "milk"]).unwrap(),
             CliCommand::Quick {
-                title: "buy milk".to_string()
+                title: "buy milk".to_string(),
+                due: None,
+                remind: false,
             }
         );
         assert_eq!(
@@ -898,6 +1149,8 @@ mod tests {
                 project: Some("Home".to_string()),
                 title: Some("fix light".to_string()),
                 notes: Some("check breaker".to_string()),
+                due: None,
+                remind: None,
             }
         );
     }
@@ -911,6 +1164,8 @@ mod tests {
                 project: None,
                 title: None,
                 notes: Some(String::new()),
+                due: None,
+                remind: None,
             }
         );
     }
@@ -989,6 +1244,164 @@ mod tests {
     #[test]
     fn rejects_missing_required_arguments_with_usage() {
         let error = parse(&["add", "Home"]).unwrap_err().to_string();
-        assert!(error.contains("Usage: ct add <project> <task...>"));
+        assert!(error.contains("Usage: ct add [--due <date>] [--remind] <project> <task...>"));
+    }
+
+    #[test]
+    fn parses_list_due_and_format_flags() {
+        assert_eq!(
+            parse(&["list", "--due", "--relative", "Home"]).unwrap(),
+            CliCommand::List {
+                project: Some("Home".to_string()),
+                show_notes: false,
+                json: false,
+                due_only: true,
+                due_format: Some(DueFormat::Relative),
+            }
+        );
+        let error = parse(&["list", "--absolute", "--relative"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Choose only one of --absolute or --relative"));
+    }
+
+    #[test]
+    fn parses_due_and_remind_options_on_new_tasks() {
+        assert_eq!(
+            parse(&[
+                "add", "--due", "15 14:30", "Home", "pay", "rent", "--remind"
+            ])
+            .unwrap(),
+            CliCommand::Add {
+                project: "Home".to_string(),
+                title: "pay rent".to_string(),
+                due: Some("15 14:30".to_string()),
+                remind: true,
+            }
+        );
+        assert_eq!(
+            parse(&["quick", "buy", "milk", "--due", "2d"]).unwrap(),
+            CliCommand::Quick {
+                title: "buy milk".to_string(),
+                due: Some("2d".to_string()),
+                remind: false,
+            }
+        );
+
+        let error = parse(&["quick", "--remind", "buy", "milk"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--remind requires --due"));
+        let error = parse(&["quick", "buy", "--due"]).unwrap_err().to_string();
+        assert!(error.contains("Missing value for --due"));
+        let error = parse(&["quick", "--due", "1d", "--due", "2d", "x"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Duplicate --due option"));
+    }
+
+    #[test]
+    fn parses_update_due_and_remind() {
+        assert_eq!(
+            parse(&["update", "7", "--due", "4d", "--remind"]).unwrap(),
+            CliCommand::Update {
+                id: "7".to_string(),
+                project: None,
+                title: None,
+                notes: None,
+                due: Some("4d".to_string()),
+                remind: Some(true),
+            }
+        );
+        assert_eq!(
+            parse(&["update", "7", "--no-remind"]).unwrap(),
+            CliCommand::Update {
+                id: "7".to_string(),
+                project: None,
+                title: None,
+                notes: None,
+                due: None,
+                remind: Some(false),
+            }
+        );
+        assert_eq!(
+            parse(&["update", "7", "--due", ""]).unwrap(),
+            CliCommand::Update {
+                id: "7".to_string(),
+                project: None,
+                title: None,
+                notes: None,
+                due: Some(String::new()),
+                remind: None,
+            }
+        );
+
+        let error = parse(&["update", "7", "--remind", "--no-remind"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Choose only one of --remind or --no-remind"));
+        let error = parse(&["update", "7", "--due", "", "--remind"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--remind cannot be used when clearing --due"));
+    }
+
+    #[test]
+    fn parses_due_command_with_trailing_date_and_optional_time() {
+        assert_eq!(
+            parse(&["due", "3", "15"]).unwrap(),
+            CliCommand::Due {
+                ids: vec!["3".to_string()],
+                date: Some("15".to_string()),
+            }
+        );
+        assert_eq!(
+            parse(&["due", "1", "2", "15", "14:30"]).unwrap(),
+            CliCommand::Due {
+                ids: vec!["1".to_string(), "2".to_string()],
+                date: Some("15 14:30".to_string()),
+            }
+        );
+        assert_eq!(
+            parse(&["due", "3", "15 14:30"]).unwrap(),
+            CliCommand::Due {
+                ids: vec!["3".to_string()],
+                date: Some("15 14:30".to_string()),
+            }
+        );
+        assert_eq!(
+            parse(&["due", "3", "4", "--clear"]).unwrap(),
+            CliCommand::Due {
+                ids: vec!["3".to_string(), "4".to_string()],
+                date: None,
+            }
+        );
+
+        for args in [&["due"][..], &["due", "3"], &["due", "--clear"]] {
+            let error = parse(args).unwrap_err().to_string();
+            assert!(error.contains("Usage: ct due"), "{args:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn parses_remind_command() {
+        assert_eq!(
+            parse(&["remind", "3", "4", "on"]).unwrap(),
+            CliCommand::Remind {
+                ids: vec!["3".to_string(), "4".to_string()],
+                on: true,
+            }
+        );
+        assert_eq!(
+            parse(&["remind", "3", "off"]).unwrap(),
+            CliCommand::Remind {
+                ids: vec!["3".to_string()],
+                on: false,
+            }
+        );
+        let error = parse(&["remind", "3"]).unwrap_err().to_string();
+        assert!(error.contains("Expected on or off"));
+        let error = parse(&["remind", "on"]).unwrap_err().to_string();
+        assert!(error.contains("Missing task ID"));
     }
 }

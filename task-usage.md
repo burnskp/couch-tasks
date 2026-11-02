@@ -9,6 +9,7 @@ See [using ct](cli.md) for task workflows.
 ```sh
 ct list --json
 ct list --json Home
+ct list --due --json
 ct completed --json
 ct completed --json Home
 ct projects --json
@@ -30,10 +31,14 @@ Each task includes these fields:
 | `sort_order` | One-based position for pending tasks within their project |
 | `created_at`, `updated_at` | Timestamp strings |
 | `completed_at` | Completion timestamp, or `null` for pending tasks |
+| `due_at` | Due timestamp in UTC (`2026-11-15T14:00:00Z`), or `null` |
+| `remind` | `true` when a reminder is set; only possible with a due date |
 | `id`, `project_id` | Internal metadata; do not use these as command selectors |
 
 Pending tasks are ordered by project (`inbox` first, then names) and position
-within the project. JSON output does not update the interactive numeric IDs.
+within the project. `ct list --due --json` returns only pending tasks with due
+dates, ordered by due time. JSON output does not update the interactive numeric
+IDs.
 
 ## Change tasks safely
 
@@ -55,12 +60,15 @@ ct("quick", "buy milk")
 tasks = json.loads(ct("list", "--json", "inbox"))
 task_uuid = tasks[-1]["uuid"]
 ct("update", task_uuid, "--title", "buy oat milk", "--notes", "")
+ct("due", task_uuid, "2026-11-15", "14:30")
+ct("remind", task_uuid, "on")
 ct("done", task_uuid)
 ct("undone", task_uuid)
 ```
 
 Use `update` for non-interactive edits; `edit` opens an editor. Pass UUIDs to
-`move`, `reorder`, `note`, `show`, and `delete` in the same way. Reorder positions
+`move`, `reorder`, `note`, `show`, `due`, `remind`, and `delete` in the same way.
+Due dates are read in the local timezone of the `ct` process. Reorder positions
 are relative to the task's project, so use a single-project view for drag ordering.
 Refresh task and project lists after successful changes or sync.
 

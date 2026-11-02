@@ -25,6 +25,8 @@ pub struct Task {
     pub updated_at: String,
     pub completed_at: Option<String>,
     pub reviewed_at: String,
+    pub due_at: Option<String>,
+    pub remind: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

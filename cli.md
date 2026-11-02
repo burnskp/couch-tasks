@@ -100,6 +100,8 @@ For longer edits, run `ct edit <id>`. It opens `$EDITOR`, or `vi` if unset:
 ```text
 Project: Home
 Status: pending
+Due: 2026-11-15 09:00
+Remind: no
 
 Title:
 fix garage light
@@ -108,9 +110,80 @@ Notes:
 Check the breaker first.
 ```
 
-Edit the project, single-line title, or notes, keeping the section headings.
+Edit the project, due date, reminder, single-line title, or notes, keeping the
+section headings.
 Save and close the editor to apply the changes. Use `done` and `undone` to change
 status; editing the `Status` line does not change it.
+
+## Due dates and reminders
+
+```sh
+ct quick --due 4d pay rent
+ct add Home fix garage light --due 11-15 --remind
+ct due 2 2026-11-20 14:30
+ct due 2 3 --clear
+ct remind 2 on
+ct update 2 --due 1w --no-remind
+ct list --due
+```
+
+Due dates accept these forms, each optionally followed by a 24-hour `HH:MM`
+time:
+
+| Form         | Meaning                                         |
+| ------------ | ----------------------------------------------- |
+| `YYYY-MM-DD` | That date                                       |
+| `YY-MM-DD`   | That date in 20YY                               |
+| `MM-DD`      | That month and day this year                    |
+| `DD`         | That day this month                             |
+| `<n>w<n>d`   | Weeks and/or days from today: `4d`, `1w`, `2w3d` |
+
+Without a time, the due time is 09:00. Dates and times are read and shown in
+your local timezone. Dates in the past are accepted and show as overdue. A local
+time skipped by a daylight saving change is an error; a repeated one uses the
+earlier time.
+
+`ct due <id...> <date>` treats the last argument as the date, or the last two
+when the final one is a time, so `ct due 3 15` sets task 3 due on the 15th.
+`--clear` removes the due date. `update --due ""` also clears it.
+
+A reminder can only be set on a task with a due date, and clearing a due date
+turns its reminder off. `ct remind <id...> on|off` changes several tasks at once
+and changes none if any selected task has no due date. Reminders are stored and
+synced; this version of `ct` does not send notifications.
+
+`ct list` shows `[due …]` and `[remind]` after task titles. `ct list --due`
+shows only pending tasks with due dates, soonest first, in columns for the due
+date, reminder, project, and title; add a project name to filter it. It assigns
+numeric IDs like `ct list`. Overdue dates are shown in red with a `!` prefix.
+`ct show` displays the due date with the time remaining, and `ct edit` includes
+`Due:` and `Remind: yes|no` lines that accept the same date forms. Completed
+tasks keep their due date and reminder.
+
+Due dates are shown as `YYYY-MM-DD HH:MM` by default. To show the time remaining
+instead, pass `--relative` to `ct list`, set `CT_DUE_FORMAT=relative`, or add a
+`due` section to the config file:
+
+```json
+{
+  "due": {
+    "format": "relative"
+  }
+}
+```
+
+The format is chosen from `--absolute`/`--relative`, then `CT_DUE_FORMAT`, then
+the config file, falling back to `absolute`. It also applies to `ct completed`
+and `ct review`. Relative times are rounded down:
+
+| Time remaining | Shown as            | Example        |
+| -------------- | ------------------- | -------------- |
+| 7 days or more | weeks and days      | `2w3d`         |
+| 3 to 7 days    | days                | `4d`           |
+| 1 to 3 days    | days and hours      | `2d5h`         |
+| Under 1 day    | hours and minutes   | `5h30m`, `45m` |
+
+Overdue tasks show how long ago they were due, such as `!2d5h`.
 
 ## Review tasks
 

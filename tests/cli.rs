@@ -20,7 +20,10 @@ impl TestApp {
 
     fn command(&self) -> Command {
         let mut cmd = Command::cargo_bin("ct").expect("ct binary");
-        cmd.env("CT_DB", &self.db_path);
+        cmd.env("CT_DB", &self.db_path)
+            .env("XDG_CONFIG_HOME", self._dir.path().join("config"))
+            .env("TZ", "UTC")
+            .env_remove("CT_DUE_FORMAT");
         cmd
     }
 
@@ -74,7 +77,7 @@ fn invalid_arguments_exit_with_user_error() {
         .assert()
         .code(1)
         .stderr(predicate::str::contains(
-            "Usage: ct add <project> <task...>",
+            "Usage: ct add [--due <date>] [--remind] <project> <task...>",
         ));
 }
 
@@ -934,7 +937,7 @@ fn edit_uses_editor_and_saves_valid_changes() {
     let editor = app._dir.path().join("fake-editor.sh");
     fs::write(
         &editor,
-        "#!/bin/sh\ncat > \"$1\" <<'EOF'\nProject: Home\nStatus: pending\n\nTitle:\nreplace air filter\n\nNotes:\nCheck size.\nEOF\n",
+        "#!/bin/sh\ncat > \"$1\" <<'EOF'\nProject: Home\nStatus: pending\nDue: 2099-12-01 14:30\nRemind: yes\n\nTitle:\nreplace air filter\n\nNotes:\nCheck size.\nEOF\n",
     )
     .expect("write fake editor");
     let mut permissions = fs::metadata(&editor).expect("metadata").permissions();
@@ -952,7 +955,151 @@ fn edit_uses_editor_and_saves_valid_changes() {
         .arg("Home")
         .assert()
         .success()
-        .stdout("1  Home  replace air filter [note]\n");
+        .stdout("1  Home  replace air filter [due 2099-12-01 14:30] [remind] [note]\n");
+}
+
+#[test]
+fn due_dates_and_reminders_can_be_set_listed_and_cleared() {
+    let app = TestApp::new();
+
+    app.command()
+        .args(["quick", "--due", "2099-12-01", "--remind", "pay", "rent"])
+        .assert()
+        .success()
+        .stdout("Added to inbox: pay rent (due 2099-12-01 09:00)\n");
+    app.command()
+        .args([
+            "add",
+            "Home",
+            "renew",
+            "passport",
+            "--due",
+            "20-01-01 08:15",
+        ])
+        .assert()
+        .success()
+        .stdout("Added to Home: renew passport (due 2020-01-01 08:15)\n");
+    app.command()
+        .args(["quick", "buy", "milk"])
+        .assert()
+        .success();
+
+    app.command().arg("list").assert().success().stdout(concat!(
+        "1  inbox  pay rent [due 2099-12-01 09:00] [remind]\n",
+        "\x1b[48;2;220;224;232m2  inbox  buy milk\x1b[0m\n",
+        "3  Home   renew passport [due \x1b[31m!2020-01-01 08:15\x1b[39m]\n",
+    ));
+
+    app.command()
+        .args(["list", "--due"])
+        .assert()
+        .success()
+        .stdout(concat!(
+            "1  \x1b[31m!2020-01-01 08:15\x1b[39m            Home   renew passport\n",
+            "\x1b[48;2;220;224;232m2  2099-12-01 09:00   [remind]  inbox  pay rent\x1b[0m\n",
+        ));
+
+    app.command()
+        .args(["remind", "1", "on"])
+        .assert()
+        .success()
+        .stdout("Reminder on 1: renew passport\n");
+    app.command()
+        .args(["due", "2", "--clear"])
+        .assert()
+        .success()
+        .stdout("Cleared due date 2: pay rent\n");
+
+    let assert = app.command().args(["list", "--json"]).assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf8 stdout");
+    let tasks: serde_json::Value = serde_json::from_str(&stdout).expect("valid json");
+    assert_eq!(tasks[0]["title"], "pay rent");
+    assert_eq!(tasks[0]["due_at"], serde_json::Value::Null);
+    assert_eq!(tasks[0]["remind"], false);
+    assert_eq!(tasks[2]["due_at"], "2020-01-01T08:15:00Z");
+    assert_eq!(tasks[2]["remind"], true);
+
+    app.command()
+        .args(["list", "--due", "inbox"])
+        .assert()
+        .success()
+        .stdout("inbox has no pending tasks with due dates.\n");
+
+    app.list();
+    app.command()
+        .args(["remind", "1", "2", "on"])
+        .assert()
+        .code(1)
+        .stderr("Task has no due date: 1\nTask has no due date: 2\n");
+    app.command()
+        .args(["update", "1", "--remind"])
+        .assert()
+        .code(1)
+        .stderr("Task has no due date: 1\n");
+    app.command()
+        .args(["due", "1", "2", "2099-01-02", "17:45"])
+        .assert()
+        .success()
+        .stdout(concat!(
+            "Due 1: pay rent (due 2099-01-02 17:45)\n",
+            "Due 2: buy milk (due 2099-01-02 17:45)\n",
+        ));
+    app.command()
+        .args(["due", "1", "2099-02-30"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("Invalid due date: 2099-02-30"));
+
+    app.command()
+        .args(["update", "3", "--due", ""])
+        .assert()
+        .success();
+    app.command()
+        .args(["show", "3"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Due:").not());
+    app.command().args(["show", "1"]).assert().success().stdout(
+        predicate::str::contains("Due: 2099-01-02 17:45 (")
+            .and(predicate::str::contains("Remind: no\n")),
+    );
+}
+
+#[test]
+fn due_format_can_be_relative_from_flag_or_config() {
+    let app = TestApp::new();
+
+    app.command()
+        .args(["quick", "--due", "2020-01-01", "late"])
+        .assert()
+        .success();
+    app.command()
+        .args(["list", "--relative"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::is_match(r"^1  inbox  late \[due \x1b\[31m!\d+w(\d+d)?\x1b\[39m\]\n$")
+                .unwrap(),
+        );
+
+    let dir = app._dir.path().join("config").join("couch-tasks");
+    fs::create_dir_all(&dir).expect("create config dir");
+    fs::write(
+        dir.join("config.json"),
+        r#"{"due": {"format": "relative"}}"#,
+    )
+    .expect("write config");
+    app.command()
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[due \x1b[31m!"))
+        .stdout(predicate::str::contains("2020").not());
+    app.command()
+        .args(["list", "--absolute"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("!2020-01-01 09:00"));
 }
 
 #[test]

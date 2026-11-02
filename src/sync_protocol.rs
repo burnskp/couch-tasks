@@ -42,6 +42,8 @@ pub struct SyncTask {
     pub sync_revision: i64,
     pub sync_dirty: bool,
     pub reviewed_at: String,
+    pub due_at: Option<String>,
+    pub remind: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
+    due,
     error::AppError,
     models::{Project, Task, TaskStatus, normalize_project_name},
     sync_protocol::{
@@ -19,7 +20,7 @@ use crate::{
     },
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const INBOX: &str = "inbox";
 /// Highest checkpoint a client may bootstrap a pristine server from. It leaves the server
 /// ample revision headroom and keeps revisions exactly representable as JSON numbers.
@@ -81,7 +82,11 @@ impl Storage {
 
         match version {
             0 => self.create_schema()?,
-            3 => self.migrate_v3_to_v4()?,
+            3 => {
+                self.migrate_v3_to_v4()?;
+                self.migrate_v4_to_v5()?;
+            }
+            4 => self.migrate_v4_to_v5()?,
             SCHEMA_VERSION => {}
             version => {
                 return Err(AppError::StorageMessage(format!(
@@ -122,7 +127,9 @@ impl Storage {
               completed_at TEXT,
               sync_revision INTEGER NOT NULL DEFAULT 0,
               sync_dirty INTEGER NOT NULL DEFAULT 1,
-              reviewed_at TEXT NOT NULL
+              reviewed_at TEXT NOT NULL,
+              due_at TEXT,
+              remind INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE sync_tombstones (
@@ -154,6 +161,19 @@ impl Storage {
                 ALTER TABLE tasks ADD COLUMN reviewed_at TEXT NOT NULL DEFAULT '';
                 UPDATE tasks SET reviewed_at = created_at;
                 PRAGMA user_version = 4;
+                ",
+            )?;
+            Ok(())
+        })
+    }
+
+    fn migrate_v4_to_v5(&self) -> Result<(), AppError> {
+        self.in_immediate_transaction(|| {
+            self.conn.execute_batch(
+                "
+                ALTER TABLE tasks ADD COLUMN due_at TEXT;
+                ALTER TABLE tasks ADD COLUMN remind INTEGER NOT NULL DEFAULT 0;
+                PRAGMA user_version = 5;
                 ",
             )?;
             Ok(())
@@ -257,7 +277,8 @@ impl Storage {
             .query_row(
                 "
                 SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
-                       t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at
+                       t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at,
+                       t.due_at, t.remind
                 FROM tasks t
                 JOIN projects p ON p.id = t.project_id
                 WHERE t.id = ?1
@@ -274,7 +295,8 @@ impl Storage {
             .query_row(
                 "
                 SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
-                       t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at
+                       t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at,
+                       t.due_at, t.remind
                 FROM tasks t
                 JOIN projects p ON p.id = t.project_id
                 WHERE t.uuid = ?1
@@ -319,7 +341,8 @@ impl Storage {
         let mut statement = self.conn.prepare(
             "
             SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
-                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at
+                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at,
+                   t.due_at, t.remind
             FROM tasks t
             JOIN projects p ON p.id = t.project_id
             WHERE t.status = 'pending'
@@ -347,7 +370,8 @@ impl Storage {
         let mut statement = self.conn.prepare(
             "
             SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
-                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at
+                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at,
+                   t.due_at, t.remind
             FROM tasks t
             JOIN projects p ON p.id = t.project_id
             WHERE t.status = 'pending'
@@ -366,7 +390,8 @@ impl Storage {
         let mut statement = self.conn.prepare(
             "
             SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
-                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at
+                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at,
+                   t.due_at, t.remind
             FROM tasks t
             JOIN projects p ON p.id = t.project_id
             WHERE t.status = 'done'
@@ -394,7 +419,8 @@ impl Storage {
         let mut statement = self.conn.prepare(
             "
             SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
-                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at
+                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at,
+                   t.due_at, t.remind
             FROM tasks t
             JOIN projects p ON p.id = t.project_id
             WHERE t.status = 'done'
@@ -440,7 +466,8 @@ impl Storage {
         let mut statement = self.conn.prepare(
             "
             SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
-                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at
+                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at,
+                   t.due_at, t.remind
             FROM tasks t
             JOIN projects p ON p.id = t.project_id
             WHERE t.status = 'pending'
@@ -626,6 +653,84 @@ impl Storage {
         }
 
         self.get_task(id)
+    }
+
+    pub fn set_task_due(
+        &self,
+        id: i64,
+        due_at: Option<&str>,
+        remind: bool,
+    ) -> Result<Option<Task>, AppError> {
+        if remind && due_at.is_none() {
+            return Err(AppError::User(
+                "A reminder requires a due date.".to_string(),
+            ));
+        }
+
+        let now = now_timestamp();
+        self.conn.execute(
+            "
+            UPDATE tasks
+            SET due_at = ?1, remind = ?2, updated_at = ?3, sync_dirty = 1
+            WHERE id = ?4
+            ",
+            params![due_at, remind, now, id],
+        )?;
+
+        self.get_task(id)
+    }
+
+    /// Pending tasks with due dates, soonest first.
+    pub fn list_due_tasks(&self) -> Result<Vec<Task>, AppError> {
+        let mut statement = self.conn.prepare(
+            "
+            SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
+                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at,
+                   t.due_at, t.remind
+            FROM tasks t
+            JOIN projects p ON p.id = t.project_id
+            WHERE t.status = 'pending'
+              AND t.due_at IS NOT NULL
+            ORDER BY t.due_at,
+                     CASE WHEN p.name_normalized = 'inbox' THEN 0 ELSE 1 END,
+                     p.name COLLATE NOCASE,
+                     t.sort_order,
+                     t.id
+            ",
+        )?;
+
+        let tasks = statement
+            .query_map([], task_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(tasks)
+    }
+
+    pub fn list_due_tasks_for_project(
+        &self,
+        name: &str,
+    ) -> Result<Option<(Project, Vec<Task>)>, AppError> {
+        let Some(project) = self.find_project(name)? else {
+            return Ok(None);
+        };
+
+        let mut statement = self.conn.prepare(
+            "
+            SELECT t.id, t.uuid, t.project_id, p.name, t.sort_order, t.title, t.notes,
+                   t.status, t.created_at, t.updated_at, t.completed_at, t.reviewed_at,
+                   t.due_at, t.remind
+            FROM tasks t
+            JOIN projects p ON p.id = t.project_id
+            WHERE t.status = 'pending'
+              AND t.due_at IS NOT NULL
+              AND p.id = ?1
+            ORDER BY t.due_at, t.sort_order, t.id
+            ",
+        )?;
+
+        let tasks = statement
+            .query_map(params![project.id], task_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some((project, tasks)))
     }
 
     pub fn clear_completed_tasks(&self, project_name: Option<&str>) -> Result<usize, AppError> {
@@ -1165,6 +1270,21 @@ impl Storage {
             validate_sync_timestamp("task", &task.uuid, "created_at", &task.created_at)?;
             validate_sync_timestamp("task", &task.uuid, "updated_at", &task.updated_at)?;
             validate_sync_timestamp("task", &task.uuid, "reviewed_at", &task.reviewed_at)?;
+            match &task.due_at {
+                Some(due_at) if due::parse_due_timestamp(due_at).is_none() => {
+                    return Err(AppError::SyncBadRequest(format!(
+                        "task {} has an invalid due_at timestamp: {due_at:?}",
+                        task.uuid
+                    )));
+                }
+                None if task.remind => {
+                    return Err(AppError::SyncBadRequest(format!(
+                        "task {} has a reminder without a due date",
+                        task.uuid
+                    )));
+                }
+                _ => {}
+            }
             if let Some(completed_at) = &task.completed_at {
                 validate_sync_timestamp("task", &task.uuid, "completed_at", completed_at)?;
             }
@@ -1324,7 +1444,7 @@ impl Storage {
                 "
                 SELECT t.uuid, p.uuid, t.sort_order, t.title, t.notes, t.status,
                        t.created_at, t.updated_at, t.completed_at, t.sync_revision,
-                       t.sync_dirty, t.reviewed_at
+                       t.sync_dirty, t.reviewed_at, t.due_at, t.remind
                 FROM tasks t
                 JOIN projects p ON p.id = t.project_id
                 WHERE t.uuid = ?1
@@ -1592,7 +1712,7 @@ impl Storage {
             "
             SELECT t.uuid, p.uuid, t.sort_order, t.title, t.notes, t.status,
                    t.created_at, t.updated_at, t.completed_at, t.sync_revision, t.sync_dirty,
-                   t.reviewed_at
+                   t.reviewed_at, t.due_at, t.remind
             FROM tasks t
             JOIN projects p ON p.id = t.project_id
             ORDER BY p.name_normalized, t.sort_order, t.id
@@ -1643,7 +1763,7 @@ impl Storage {
             "
             SELECT t.uuid, p.uuid, t.sort_order, t.title, t.notes, t.status,
                    t.created_at, t.updated_at, t.completed_at, t.sync_revision, t.sync_dirty,
-                   t.reviewed_at
+                   t.reviewed_at, t.due_at, t.remind
             FROM tasks t
             JOIN projects p ON p.id = t.project_id
             WHERE t.sync_revision > ?1
@@ -1743,8 +1863,8 @@ impl Storage {
             "
             INSERT INTO tasks (
               uuid, project_id, sort_order, title, notes, status, created_at, updated_at,
-              completed_at, sync_revision, sync_dirty, reviewed_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+              completed_at, sync_revision, sync_dirty, reviewed_at, due_at, remind
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             ON CONFLICT(uuid) DO UPDATE SET
               project_id = excluded.project_id,
               sort_order = excluded.sort_order,
@@ -1756,7 +1876,9 @@ impl Storage {
               completed_at = excluded.completed_at,
               sync_revision = excluded.sync_revision,
               sync_dirty = excluded.sync_dirty,
-              reviewed_at = excluded.reviewed_at
+              reviewed_at = excluded.reviewed_at,
+              due_at = excluded.due_at,
+              remind = excluded.remind
             ",
             params![
                 task.uuid,
@@ -1770,7 +1892,9 @@ impl Storage {
                 task.completed_at,
                 task.sync_revision,
                 if task.sync_dirty { 1 } else { 0 },
-                task.reviewed_at
+                task.reviewed_at,
+                task.due_at,
+                task.remind
             ],
         )?;
         Ok(())
@@ -2032,6 +2156,8 @@ fn sync_task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncTask> {
         sync_revision: row.get(9)?,
         sync_dirty: row.get::<_, i64>(10)? != 0,
         reviewed_at: row.get(11)?,
+        due_at: row.get(12)?,
+        remind: row.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -2077,6 +2203,8 @@ fn sync_task_contents_equal(left: &SyncTask, right: &SyncTask) -> bool {
         && left.updated_at == right.updated_at
         && left.completed_at == right.completed_at
         && left.reviewed_at == right.reviewed_at
+        && left.due_at == right.due_at
+        && left.remind == right.remind
 }
 
 fn sync_tombstone_contents_equal(left: &SyncTombstone, right: &SyncTombstone) -> bool {
@@ -2118,6 +2246,8 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         updated_at: row.get(9)?,
         completed_at: row.get(10)?,
         reviewed_at: row.get(11)?,
+        due_at: row.get(12)?,
+        remind: row.get::<_, i64>(13)? != 0,
     })
 }
 
@@ -2413,6 +2543,136 @@ mod tests {
         sync(&second);
         let synced = second.get_task_by_uuid(&task.uuid).unwrap().unwrap();
         assert_eq!(synced.reviewed_at, reviewed.reviewed_at);
+    }
+
+    #[test]
+    fn due_dates_and_reminders_sync_to_other_clients() {
+        let first_dir = tempfile::tempdir().expect("first temp dir");
+        let second_dir = tempfile::tempdir().expect("second temp dir");
+        let server_dir = tempfile::tempdir().expect("server temp dir");
+        let first = Storage::open(first_dir.path().join("tasks.db")).expect("open first");
+        let second = Storage::open(second_dir.path().join("tasks.db")).expect("open second");
+        let server = Storage::open(server_dir.path().join("tasks.db")).expect("open server");
+        let sync = |client: &Storage| {
+            let request = client.export_sync_request().expect("export");
+            let response = server.apply_server_sync(&request).expect("server sync");
+            client
+                .apply_sync_response(&request, &response)
+                .expect("apply response");
+        };
+
+        let task = first.add_task("Home", "pay rent").expect("add");
+        first
+            .set_task_due(task.id, Some("2026-12-01T14:00:00Z"), true)
+            .expect("set due");
+        sync(&first);
+        sync(&second);
+        let synced = second.get_task_by_uuid(&task.uuid).unwrap().unwrap();
+        assert_eq!(synced.due_at.as_deref(), Some("2026-12-01T14:00:00Z"));
+        assert!(synced.remind);
+        assert_eq!(
+            second
+                .list_due_tasks()
+                .unwrap()
+                .iter()
+                .map(|task| task.uuid.as_str())
+                .collect::<Vec<_>>(),
+            [task.uuid.as_str()]
+        );
+
+        second
+            .set_task_due(synced.id, None, false)
+            .expect("clear due");
+        sync(&second);
+        sync(&first);
+        let cleared = first.get_task_by_uuid(&task.uuid).unwrap().unwrap();
+        assert_eq!(cleared.due_at, None);
+        assert!(!cleared.remind);
+    }
+
+    #[test]
+    fn reminders_require_due_dates() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage = Storage::open(dir.path().join("tasks.db")).expect("open storage");
+        let task = storage.add_task("Home", "pay rent").expect("add");
+
+        let error = storage.set_task_due(task.id, None, true).unwrap_err();
+        assert!(error.to_string().contains("A reminder requires a due date"));
+
+        let mut request = storage.export_sync_request().expect("export");
+        request.tasks[0].remind = true;
+        assert!(matches!(
+            storage.apply_server_sync(&request),
+            Err(AppError::SyncBadRequest(message)) if message.contains("reminder without a due date")
+        ));
+
+        for due_at in ["2026-12-01", "2026-12-01T09:00:00-05:00"] {
+            let mut request = storage.export_sync_request().expect("export");
+            request.tasks[0].due_at = Some(due_at.to_string());
+            assert!(matches!(
+                storage.apply_server_sync(&request),
+                Err(AppError::SyncBadRequest(message)) if message.contains("invalid due_at")
+            ));
+        }
+    }
+
+    #[test]
+    fn due_list_orders_by_due_then_project_order() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage = Storage::open(dir.path().join("tasks.db")).expect("open storage");
+        let add = |project: &str, title: &str, due_at: Option<&str>| {
+            let task = storage.add_task(project, title).expect("add");
+            if let Some(due_at) = due_at {
+                storage
+                    .set_task_due(task.id, Some(due_at), false)
+                    .expect("due");
+            }
+            task
+        };
+        add("Work", "later", Some("2026-12-02T09:00:00Z"));
+        add("Work", "tie work", Some("2026-12-01T09:00:00Z"));
+        add("inbox", "tie inbox", Some("2026-12-01T09:00:00Z"));
+        add("inbox", "no due", None);
+        let done = add("Home", "done", Some("2026-11-01T09:00:00Z"));
+        storage.mark_done(done.id).expect("done");
+
+        let titles =
+            |tasks: Vec<Task>| tasks.into_iter().map(|task| task.title).collect::<Vec<_>>();
+        assert_eq!(
+            titles(storage.list_due_tasks().unwrap()),
+            ["tie inbox", "tie work", "later"]
+        );
+        let (_, work) = storage.list_due_tasks_for_project("work").unwrap().unwrap();
+        assert_eq!(titles(work), ["tie work", "later"]);
+    }
+
+    #[test]
+    fn opening_v4_database_adds_due_columns() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("tasks.db");
+        let storage = Storage::open(path.clone()).expect("open storage");
+        let task = storage.add_task("Home", "fix light").expect("add");
+        storage
+            .conn
+            .execute_batch(
+                "
+                ALTER TABLE tasks DROP COLUMN due_at;
+                ALTER TABLE tasks DROP COLUMN remind;
+                PRAGMA user_version = 4;
+                ",
+            )
+            .expect("downgrade to v4");
+        drop(storage);
+
+        let storage = Storage::open(path).expect("reopen storage");
+        let version: i64 = storage
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let migrated = storage.get_task(task.id).unwrap().unwrap();
+        assert_eq!(migrated.due_at, None);
+        assert!(!migrated.remind);
     }
 
     #[test]
@@ -3256,6 +3516,8 @@ mod tests {
             sync_revision: 0,
             sync_dirty: true,
             reviewed_at: now_timestamp(),
+            due_at: None,
+            remind: false,
         });
         let response = server
             .apply_server_sync(&stale)
@@ -3309,6 +3571,8 @@ mod tests {
             sync_revision: 0,
             sync_dirty: true,
             reviewed_at: now_timestamp(),
+            due_at: None,
+            remind: false,
         });
 
         let error = server.apply_server_sync(&request).unwrap_err();
@@ -3453,6 +3717,8 @@ mod tests {
             sync_revision: 0,
             sync_dirty: true,
             reviewed_at: now_timestamp(),
+            due_at: None,
+            remind: false,
         });
         assert!(matches!(
             storage.apply_server_sync(&invalid_status),
@@ -3482,6 +3748,8 @@ mod tests {
             sync_revision: 0,
             sync_dirty: true,
             reviewed_at: now_timestamp(),
+            due_at: None,
+            remind: false,
         });
         assert!(matches!(
             storage.apply_server_sync(&invalid_position),
@@ -3509,6 +3777,8 @@ mod tests {
             sync_revision: 0,
             sync_dirty: true,
             reviewed_at: "2026-01-0é\u{1b}]0;title\u{7}".to_string(),
+            due_at: None,
+            remind: false,
         });
         assert!(matches!(
             storage.apply_server_sync(&invalid_timestamp),
@@ -3639,6 +3909,8 @@ mod tests {
                 sync_revision: 2,
                 sync_dirty: false,
                 reviewed_at: now.clone(),
+                due_at: None,
+                remind: false,
             }],
             tombstones: Vec::new(),
         };

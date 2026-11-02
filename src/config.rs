@@ -17,6 +17,8 @@ pub(crate) struct ClientConfigFile {
     pub(crate) sync: Option<SyncConfigFile>,
     #[serde(default)]
     pub(crate) review: Option<ReviewConfigFile>,
+    #[serde(default)]
+    pub(crate) due: Option<DueConfigFile>,
 }
 
 impl ClientConfigFile {
@@ -37,6 +39,11 @@ impl ClientConfigFile {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub(crate) struct ReviewConfigFile {
     pub(crate) mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub(crate) struct DueConfigFile {
+    pub(crate) format: Option<String>,
 }
 
 pub(crate) fn client_config_path() -> Result<PathBuf, AppError> {
@@ -115,6 +122,64 @@ impl ReviewMode {
         match value.trim() {
             "task" => Some(Self::Task),
             "list" => Some(Self::List),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DueFormat {
+    #[default]
+    Absolute,
+    Relative,
+}
+
+impl DueFormat {
+    pub fn resolve(flag: Option<DueFormat>) -> Result<Self, AppError> {
+        if let Some(format) = flag {
+            return Ok(format);
+        }
+        let config_path = client_config_path()?;
+        let file_config = ClientConfigFile::load_optional(&config_path)?;
+        Self::resolve_from(
+            None,
+            env::var("CT_DUE_FORMAT").ok(),
+            file_config.due.and_then(|due| due.format),
+            &config_path,
+        )
+    }
+
+    fn resolve_from(
+        flag: Option<DueFormat>,
+        env: Option<String>,
+        file: Option<String>,
+        config_path: &Path,
+    ) -> Result<Self, AppError> {
+        if let Some(format) = flag {
+            return Ok(format);
+        }
+        if let Some(value) = env.filter(|value| !value.trim().is_empty()) {
+            return Self::parse(&value).ok_or_else(|| {
+                AppError::User(format!(
+                    "Invalid CT_DUE_FORMAT: {value:?} (expected \"absolute\" or \"relative\")"
+                ))
+            });
+        }
+        if let Some(value) = file.filter(|value| !value.trim().is_empty()) {
+            return Self::parse(&value).ok_or_else(|| {
+                AppError::User(format!(
+                    "Invalid due.format in {}: {value:?} (expected \"absolute\" or \"relative\")",
+                    config_path.display()
+                ))
+            });
+        }
+        Ok(Self::default())
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "absolute" => Some(Self::Absolute),
+            "relative" => Some(Self::Relative),
             _ => None,
         }
     }
@@ -213,5 +278,49 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("review.mode in /home/alice/.config/couch-tasks/config.json"));
+    }
+
+    #[test]
+    fn config_file_parses_due_section() {
+        let config: ClientConfigFile =
+            serde_json::from_str(r#"{"due": {"format": "relative"}}"#).expect("parse config");
+        assert_eq!(
+            config.due,
+            Some(DueConfigFile {
+                format: Some("relative".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn due_format_precedence_is_flag_then_env_then_config_then_absolute() {
+        let path = PathBuf::from("/home/alice/.config/couch-tasks/config.json");
+        let resolve = |flag, env: Option<&str>, file: Option<&str>| {
+            DueFormat::resolve_from(
+                flag,
+                env.map(str::to_string),
+                file.map(str::to_string),
+                &path,
+            )
+        };
+
+        assert_eq!(resolve(None, None, None).unwrap(), DueFormat::Absolute);
+        assert_eq!(
+            resolve(None, None, Some("relative")).unwrap(),
+            DueFormat::Relative
+        );
+        assert_eq!(
+            resolve(None, Some("absolute"), Some("relative")).unwrap(),
+            DueFormat::Absolute
+        );
+        assert_eq!(
+            resolve(Some(DueFormat::Relative), Some("absolute"), Some("bogus")).unwrap(),
+            DueFormat::Relative
+        );
+
+        let error = resolve(None, Some("soon"), None).unwrap_err().to_string();
+        assert!(error.contains("CT_DUE_FORMAT"));
+        let error = resolve(None, None, Some("soon")).unwrap_err().to_string();
+        assert!(error.contains("due.format in /home/alice/.config/couch-tasks/config.json"));
     }
 }

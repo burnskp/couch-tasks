@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod due;
 pub mod editor;
 pub mod error;
 pub mod models;

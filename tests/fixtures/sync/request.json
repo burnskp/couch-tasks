@@ -35,7 +35,9 @@
       "completed_at": null,
       "sync_revision": 0,
       "sync_dirty": true,
-      "reviewed_at": "2026-04-27T10:03:00Z"
+      "reviewed_at": "2026-04-27T10:03:00Z",
+      "due_at": "2026-05-01T13:00:00Z",
+      "remind": true
     },
     {
       "uuid": "44444444-4444-4444-8444-444444444444",
@@ -49,7 +51,9 @@
       "completed_at": "2026-04-27T09:30:00Z",
       "sync_revision": 6,
       "sync_dirty": false,
-      "reviewed_at": "2026-04-27T09:00:00Z"
+      "reviewed_at": "2026-04-27T09:00:00Z",
+      "due_at": null,
+      "remind": false
     }
   ],
   "tombstones": [

@@ -1,11 +1,13 @@
 use std::io;
 
+use chrono::Local;
 use uuid::Uuid;
 
 use crate::{
     cli,
     cli::CliCommand,
-    config::ReviewMode,
+    config::{DueFormat, ReviewMode},
+    due::{self, DueDisplay},
     editor,
     error::AppError,
     models::{Task, TaskStatus},
@@ -21,13 +23,21 @@ pub fn dispatch(command: CliCommand) -> Result<(), AppError> {
             project,
             show_notes,
             json,
+            due_only,
+            due_format,
         } => {
+            let display = DueDisplay::local(DueFormat::resolve(due_format)?);
             let storage = Storage::open_default()?;
-            list(&storage, project, show_notes, json)
+            if due_only {
+                list_due(&storage, project, show_notes, json, &display)
+            } else {
+                list(&storage, project, show_notes, json, &display)
+            }
         }
         CliCommand::Completed { project, json } => {
+            let display = DueDisplay::local(DueFormat::resolve(None)?);
             let storage = Storage::open_default()?;
-            completed(&storage, project.as_deref(), json)
+            completed(&storage, project.as_deref(), json, &display)
         }
         CliCommand::Projects { json } => {
             let storage = Storage::open_default()?;
@@ -37,13 +47,18 @@ pub fn dispatch(command: CliCommand) -> Result<(), AppError> {
             let storage = Storage::open_default()?;
             clear_completed(&storage, project.as_deref())
         }
-        CliCommand::Add { project, title } => {
+        CliCommand::Add {
+            project,
+            title,
+            due,
+            remind,
+        } => {
             let storage = Storage::open_default()?;
-            add(&storage, &project, &title)
+            add(&storage, &project, &title, due.as_deref(), remind)
         }
-        CliCommand::Quick { title } => {
+        CliCommand::Quick { title, due, remind } => {
             let storage = Storage::open_default()?;
-            add(&storage, "inbox", &title)
+            add(&storage, "inbox", &title, due.as_deref(), remind)
         }
         CliCommand::Done { ids } => {
             let storage = Storage::open_default()?;
@@ -66,9 +81,29 @@ pub fn dispatch(command: CliCommand) -> Result<(), AppError> {
             project,
             title,
             notes,
+            due,
+            remind,
         } => {
             let storage = Storage::open_default()?;
-            update(&storage, id, project, title, notes)
+            update(
+                &storage,
+                id,
+                TaskUpdate {
+                    project,
+                    title,
+                    notes,
+                    due,
+                    remind,
+                },
+            )
+        }
+        CliCommand::Due { ids, date } => {
+            let storage = Storage::open_default()?;
+            set_due(&storage, &ids, date.as_deref())
+        }
+        CliCommand::Remind { ids, on } => {
+            let storage = Storage::open_default()?;
+            set_remind(&storage, &ids, on)
         }
         CliCommand::Reorder { id, position } => {
             let storage = Storage::open_default()?;
@@ -88,12 +123,14 @@ pub fn dispatch(command: CliCommand) -> Result<(), AppError> {
         }
         CliCommand::Review { days, mode } => {
             let mode = ReviewMode::resolve(mode)?;
+            let display = DueDisplay::local(DueFormat::resolve(None)?);
             let cutoff = storage::review_cutoff(days.unwrap_or(DEFAULT_REVIEW_DAYS))?;
             let storage = Storage::open_default()?;
             review::run(
                 &storage,
                 mode,
                 &cutoff,
+                &display,
                 io::stdin().lock(),
                 io::stdout().lock(),
             )
@@ -117,14 +154,44 @@ pub fn dispatch(command: CliCommand) -> Result<(), AppError> {
 
 const DEFAULT_REVIEW_DAYS: i64 = 7;
 
-fn add(storage: &Storage, project: &str, title: &str) -> Result<(), AppError> {
-    let task = storage.add_task(project, title)?;
+fn add(
+    storage: &Storage,
+    project: &str,
+    title: &str,
+    due: Option<&str>,
+    remind: bool,
+) -> Result<(), AppError> {
+    let due_at = due.map(parse_due_now).transpose()?;
+    let mut task = storage.add_task(project, title)?;
+    if let Some(due_at) = &due_at {
+        task = storage
+            .set_task_due(task.id, Some(due_at), remind)?
+            .ok_or_else(|| AppError::StorageMessage("created task disappeared".to_string()))?;
+    }
     println!(
-        "Added to {}: {}",
+        "Added to {}: {}{}",
         output::escape_terminal(&task.project_name),
-        output::escape_terminal(&task.title)
+        output::escape_terminal(&task.title),
+        due_suffix(&task)
     );
     Ok(())
+}
+
+fn parse_due_now(input: &str) -> Result<String, AppError> {
+    due::parse_due(input, &Local::now())
+}
+
+/// ` (due YYYY-MM-DD HH:MM)` confirming a parsed due date, or nothing.
+fn due_suffix(task: &Task) -> String {
+    task.due_at
+        .as_deref()
+        .map(|due_at| {
+            format!(
+                " (due {})",
+                DueDisplay::local(DueFormat::Absolute).absolute(due_at)
+            )
+        })
+        .unwrap_or_default()
 }
 
 fn list(
@@ -132,6 +199,7 @@ fn list(
     project: Option<String>,
     show_notes: bool,
     json: bool,
+    display: &DueDisplay,
 ) -> Result<(), AppError> {
     match project {
         Some(project) => {
@@ -149,7 +217,12 @@ fn list(
                 storage.save_visible_id_mapping(&tasks)?;
                 print!(
                     "{}",
-                    output::format_visible_project_task_list(&project.name, &tasks, show_notes)
+                    output::format_visible_project_task_list(
+                        &project.name,
+                        &tasks,
+                        show_notes,
+                        display
+                    )
                 );
             }
         }
@@ -159,7 +232,10 @@ fn list(
                 print!("{}", output::format_task_list_json(&tasks));
             } else {
                 storage.save_visible_id_mapping(&tasks)?;
-                print!("{}", output::format_visible_task_list(&tasks, show_notes));
+                print!(
+                    "{}",
+                    output::format_visible_task_list(&tasks, show_notes, display)
+                );
             }
         }
     }
@@ -167,7 +243,54 @@ fn list(
     Ok(())
 }
 
-fn completed(storage: &Storage, project: Option<&str>, json: bool) -> Result<(), AppError> {
+fn list_due(
+    storage: &Storage,
+    project: Option<String>,
+    show_notes: bool,
+    json: bool,
+    display: &DueDisplay,
+) -> Result<(), AppError> {
+    let (project_name, tasks) = match project {
+        Some(project) => {
+            let (project, tasks) =
+                storage
+                    .list_due_tasks_for_project(&project)?
+                    .ok_or_else(|| {
+                        AppError::User(format!(
+                            "Project not found: {}",
+                            output::escape_terminal(&project)
+                        ))
+                    })?;
+            (Some(project.name), tasks)
+        }
+        None => (None, storage.list_due_tasks()?),
+    };
+
+    if json {
+        print!("{}", output::format_task_list_json(&tasks));
+        return Ok(());
+    }
+
+    storage.save_visible_id_mapping(&tasks)?;
+    match project_name {
+        Some(name) => print!(
+            "{}",
+            output::format_visible_project_due_task_list(&name, &tasks, show_notes, display)
+        ),
+        None => print!(
+            "{}",
+            output::format_visible_due_task_list(&tasks, show_notes, display)
+        ),
+    }
+    Ok(())
+}
+
+fn completed(
+    storage: &Storage,
+    project: Option<&str>,
+    json: bool,
+    display: &DueDisplay,
+) -> Result<(), AppError> {
     let tasks = match project {
         Some(project) => {
             let (project, tasks) = storage
@@ -183,7 +306,7 @@ fn completed(storage: &Storage, project: Option<&str>, json: bool) -> Result<(),
             } else {
                 print!(
                     "{}",
-                    output::format_completed_task_list(&project.name, &tasks)
+                    output::format_completed_task_list(&project.name, &tasks, display)
                 );
             }
             return Ok(());
@@ -194,7 +317,10 @@ fn completed(storage: &Storage, project: Option<&str>, json: bool) -> Result<(),
     if json {
         print!("{}", output::format_task_list_json(&tasks));
     } else {
-        print!("{}", output::format_completed_task_list_all(&tasks));
+        print!(
+            "{}",
+            output::format_completed_task_list_all(&tasks, display)
+        );
     }
 
     Ok(())
@@ -440,27 +566,112 @@ fn move_task(storage: &Storage, id: String, project: &str) -> Result<(), AppErro
     }
 }
 
-fn update(
-    storage: &Storage,
-    id: String,
+struct TaskUpdate {
     project: Option<String>,
     title: Option<String>,
     notes: Option<String>,
-) -> Result<(), AppError> {
-    let resolved = resolve_task(storage, &id)?;
-    let project = project.unwrap_or(resolved.task.project_name);
-    let title = title.unwrap_or(resolved.task.title);
-    let notes = notes.unwrap_or(resolved.task.notes);
+    /// An empty value clears the due date.
+    due: Option<String>,
+    remind: Option<bool>,
+}
 
-    let task = storage
+fn update(storage: &Storage, id: String, update: TaskUpdate) -> Result<(), AppError> {
+    let resolved = resolve_task(storage, &id)?;
+    let due_at = match update.due.as_deref() {
+        None => resolved.task.due_at.clone(),
+        Some("") => None,
+        Some(input) => Some(parse_due_now(input)?),
+    };
+    let remind = update
+        .remind
+        .unwrap_or(resolved.task.remind && due_at.is_some());
+    if remind && due_at.is_none() {
+        return Err(AppError::User(format!(
+            "Task has no due date: {}",
+            resolved.label
+        )));
+    }
+    let project = update.project.unwrap_or(resolved.task.project_name);
+    let title = update.title.unwrap_or(resolved.task.title);
+    let notes = update.notes.unwrap_or(resolved.task.notes);
+
+    let mut task = storage
         .update_task_details(resolved.task.id, &project, &title, &notes)?
         .ok_or_else(|| AppError::User(format!("Task not found: {}", resolved.label)))?;
+    if task.due_at != due_at || task.remind != remind {
+        task = storage
+            .set_task_due(task.id, due_at.as_deref(), remind)?
+            .ok_or_else(|| AppError::User(format!("Task not found: {}", resolved.label)))?;
+    }
     println!(
         "Updated {}: {}",
         resolved.label,
         output::escape_terminal(&task.title)
     );
     Ok(())
+}
+
+fn set_due(storage: &Storage, ids: &[String], date: Option<&str>) -> Result<(), AppError> {
+    let due_at = date.map(parse_due_now).transpose()?;
+    let tasks = resolve_tasks(storage, ids)?;
+
+    for resolved in tasks {
+        // Clearing the due date also turns the reminder off.
+        let remind = due_at.is_some() && resolved.task.remind;
+        let task = storage
+            .set_task_due(resolved.task.id, due_at.as_deref(), remind)?
+            .ok_or_else(|| validated_task_disappeared(&resolved))?;
+        match &due_at {
+            Some(_) => println!(
+                "Due {}: {}{}",
+                resolved.label,
+                output::escape_terminal(&task.title),
+                due_suffix(&task)
+            ),
+            None => println!(
+                "Cleared due date {}: {}",
+                resolved.label,
+                output::escape_terminal(&task.title)
+            ),
+        }
+    }
+
+    Ok(())
+}
+
+fn set_remind(storage: &Storage, ids: &[String], on: bool) -> Result<(), AppError> {
+    let tasks = resolve_tasks(storage, ids)?;
+    if on {
+        let errors = tasks
+            .iter()
+            .filter(|resolved| resolved.task.due_at.is_none())
+            .map(|resolved| format!("Task has no due date: {}", resolved.label))
+            .collect::<Vec<_>>();
+        if !errors.is_empty() {
+            return Err(AppError::User(errors.join("\n")));
+        }
+    }
+
+    for resolved in tasks {
+        storage
+            .set_task_due(resolved.task.id, resolved.task.due_at.as_deref(), on)?
+            .ok_or_else(|| validated_task_disappeared(&resolved))?;
+        println!(
+            "Reminder {} {}: {}",
+            if on { "on" } else { "off" },
+            resolved.label,
+            output::escape_terminal(&resolved.task.title)
+        );
+    }
+
+    Ok(())
+}
+
+fn validated_task_disappeared(resolved: &ResolvedTask) -> AppError {
+    AppError::StorageMessage(format!(
+        "validated task disappeared before update: {}",
+        resolved.task.id
+    ))
 }
 
 fn reorder_task(storage: &Storage, id: String, position: i64) -> Result<(), AppError> {
@@ -509,14 +720,9 @@ fn append_note(storage: &Storage, id: String, note: &str) -> Result<(), AppError
 
 fn edit(storage: &Storage, id: String) -> Result<(), AppError> {
     let resolved = resolve_task(storage, &id)?;
-    let edited = editor::edit_task(&resolved.task)?;
-    storage
-        .update_task_details(
-            resolved.task.id,
-            &edited.project,
-            &edited.title,
-            &edited.notes,
-        )?
+    let edited = editor::edit_task(&resolved.task, &DueDisplay::local(DueFormat::Absolute))?;
+    edited
+        .apply(storage, resolved.task.id)?
         .ok_or_else(|| AppError::User(format!("Task not found: {}", resolved.label)))?;
     Ok(())
 }
@@ -525,7 +731,11 @@ fn show(storage: &Storage, id: String) -> Result<(), AppError> {
     let resolved = resolve_task(storage, &id)?;
     print!(
         "{}",
-        output::format_task_details_with_id(&resolved.task, &resolved.label)
+        output::format_task_details_with_id(
+            &resolved.task,
+            &resolved.label,
+            &DueDisplay::local(DueFormat::Absolute)
+        )
     );
     Ok(())
 }

@@ -5,6 +5,7 @@ use std::{
 
 use crate::{
     config::ReviewMode,
+    due::DueDisplay,
     editor,
     error::AppError,
     models::{Project, Task},
@@ -52,12 +53,14 @@ pub fn run(
     storage: &Storage,
     mode: ReviewMode,
     cutoff: &str,
+    due: &DueDisplay,
     input: impl BufRead,
     out: impl Write,
 ) -> Result<(), AppError> {
     Review {
         storage,
         cutoff,
+        due,
         input,
         out,
         handled: HashSet::new(),
@@ -69,6 +72,7 @@ pub fn run(
 struct Review<'a, R, W> {
     storage: &'a Storage,
     cutoff: &'a str,
+    due: &'a DueDisplay,
     input: R,
     out: W,
     /// Tasks already handled this session, so moved or kept tasks are not shown twice.
@@ -126,7 +130,7 @@ impl<R: BufRead, W: Write> Review<'_, R, W> {
         writeln!(self.out, "\n== {name} ({} to review) ==", tasks.len())?;
         for (index, task) in tasks.iter().enumerate() {
             writeln!(self.out, "\n{name} ({}/{})", index + 1, tasks.len())?;
-            write!(self.out, "{}", format_task(task))?;
+            write!(self.out, "{}", format_task(task, self.due))?;
             if self.review_task(task)? == Flow::Quit {
                 return Ok(Flow::Quit);
             }
@@ -192,7 +196,7 @@ impl<R: BufRead, W: Write> Review<'_, R, W> {
             write!(
                 self.out,
                 "{}",
-                output::format_visible_project_task_list(&project.name, &tasks, true)
+                output::format_visible_project_task_list(&project.name, &tasks, true, self.due)
             )?;
 
             let Some(line) = self.prompt(LIST_PROMPT)? else {
@@ -324,10 +328,8 @@ impl<R: BufRead, W: Write> Review<'_, R, W> {
     }
 
     fn edit(&mut self, task: &Task) -> Result<bool, AppError> {
-        let edited = editor::edit_task(task).and_then(|edited| {
-            self.storage
-                .update_task_details(task.id, &edited.project, &edited.title, &edited.notes)
-        });
+        let edited = editor::edit_task(task, self.due)
+            .and_then(|edited| edited.apply(self.storage, task.id));
         let updated = match edited {
             Ok(Some(updated)) => updated,
             Ok(None) => return Ok(false),
@@ -354,8 +356,12 @@ impl<R: BufRead, W: Write> Review<'_, R, W> {
     }
 }
 
-fn format_task(task: &Task) -> String {
-    let mut output = format!("  {}\n", escape_terminal(&task.title));
+fn format_task(task: &Task, due: &DueDisplay) -> String {
+    let mut output = format!(
+        "  {}{}\n",
+        escape_terminal(&task.title),
+        output::format_due_tags(task, due)
+    );
     for line in task.notes.lines() {
         output.push_str(&format!("    {}\n", escape_terminal(line)));
     }
@@ -378,7 +384,8 @@ mod tests {
 
     fn review(storage: &Storage, mode: ReviewMode, cutoff: &str, input: &str) -> String {
         let mut out = Vec::new();
-        run(storage, mode, cutoff, input.as_bytes(), &mut out).expect("review");
+        let due = DueDisplay::local(crate::config::DueFormat::Absolute);
+        run(storage, mode, cutoff, &due, input.as_bytes(), &mut out).expect("review");
         String::from_utf8(out).expect("utf8 output")
     }
 
@@ -412,7 +419,10 @@ mod tests {
         let mut task = storage.add_task("Home", "task").expect("add");
         task.reviewed_at = "2026-01-0é\u{1b}]0;title\u{7}".to_string();
 
-        let output = format_task(&task);
+        let output = format_task(
+            &task,
+            &DueDisplay::local(crate::config::DueFormat::Absolute),
+        );
 
         assert!(!output.contains('\u{1b}'), "{output:?}");
         assert!(!output.contains('\u{7}'), "{output:?}");

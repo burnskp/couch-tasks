@@ -11,6 +11,8 @@ _ct_commands=(
   'delete:Delete tasks'
   'move:Move a task to another project'
   'update:Update task fields without opening an editor'
+  'due:Set or clear due dates'
+  'remind:Turn reminders on or off'
   'reorder:Reorder a pending task within its project'
   'edit:Edit a task in $EDITOR'
   'note:Append a note to a task'
@@ -42,14 +44,24 @@ _ct() {
     args)
       case $line[1] in
         add)
-          if (( CURRENT == 2 )); then
+          if [[ $words[CURRENT-1] == --due ]]; then
+            _message 'due date'
+          elif [[ $PREFIX == -* ]]; then
+            _values 'option' '--due[set the due date]' '--remind[turn the reminder on]'
+          elif (( CURRENT == 2 )); then
             _ct_projects
           else
             _message 'task title'
           fi
           ;;
         list)
-          _arguments '--notes[show notes under tasks]' '--json[output tasks as JSON]' '*:project:_ct_projects'
+          _arguments \
+            '--notes[show notes under tasks]' \
+            '--json[output tasks as JSON]' \
+            '--due[list only tasks with due dates]' \
+            '(--relative)--absolute[show due dates as local date and time]' \
+            '(--absolute)--relative[show due dates as time remaining]' \
+            '*:project:_ct_projects'
           ;;
         completed)
           _arguments '--json[output tasks as JSON]' '*:project:_ct_projects'
@@ -72,7 +84,24 @@ _ct() {
             '1:task id:' \
             '--project[set project]:project:_ct_projects' \
             '--title[set title]:title:' \
-            '--notes[replace notes]:notes:'
+            '--notes[replace notes]:notes:' \
+            '--due[set the due date; empty clears it]:due date:' \
+            '(--no-remind)--remind[turn the reminder on]' \
+            '(--remind)--no-remind[turn the reminder off]'
+          ;;
+        due)
+          _arguments \
+            '--clear[clear the due date and reminder]' \
+            '*:task id or due date:'
+          ;;
+        remind)
+          if (( CURRENT == 2 )); then
+            _message 'task id'
+          else
+            _alternative \
+              'states:state:(on off)' \
+              'ids:task id: '
+          fi
           ;;
         reorder)
           if (( CURRENT == 2 )); then
@@ -89,7 +118,13 @@ _ct() {
           fi
           ;;
         quick)
-          _message 'task title'
+          if [[ $words[CURRENT-1] == --due ]]; then
+            _message 'due date'
+          elif [[ $PREFIX == -* ]]; then
+            _values 'option' '--due[set the due date]' '--remind[turn the reminder on]'
+          else
+            _message 'task title'
+          fi
           ;;
         review)
           _arguments \
