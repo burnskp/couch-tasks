@@ -43,7 +43,10 @@
 
             cargoLock.lockFile = ./Cargo.lock;
 
-            nativeBuildInputs = [ pkgs.makeWrapper ];
+            # Newer nixpkgs' cargoSetupHook exports AWS_LC_SYS_USE_SYSTEM=1 and
+            # LIBSQLITE3_SYS_USE_PKG_CONFIG=1, so the system libraries must be present.
+            nativeBuildInputs = [ pkgs.makeWrapper pkgs.pkg-config ];
+            buildInputs = [ pkgs.aws-lc pkgs.sqlite ];
             nativeCheckInputs = [ pkgs.openssl ];
           };
           installSyncCertificateScripts = ''
