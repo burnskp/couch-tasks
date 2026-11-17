@@ -19,6 +19,7 @@ This installs `ct` and `ct-sync-server`. Make sure Cargo's binary directory
 
 To run without installing, use `cargo run -- <command>` from the checkout.
 For Nix, Home Manager, and NixOS installation, see [Nix setup](docs/nix.md).
+To run the sync server in a container, see [Run with Docker](docs/sync.md#run-with-docker).
 
 ## Quick start
 

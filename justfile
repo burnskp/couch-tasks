@@ -34,3 +34,7 @@ clean:
 # Audit locked dependencies, including informational security warnings.
 audit:
     cargo audit --deny warnings
+
+# Build the sync server container image.
+docker-build tag="couch-tasks-sync-server:dev":
+    docker build -t {{tag}} .

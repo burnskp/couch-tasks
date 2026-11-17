@@ -18,7 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use axum_server::accept::Accept;
+use axum_server::{Handle, accept::Accept};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{
     RootCertStore, ServerConfig,
@@ -159,15 +159,55 @@ pub async fn serve(config: SyncServerConfig) -> Result<(), AppError> {
         .with_state(state);
     let tls = rustls_config(&config)?;
 
+    let handle = Handle::new();
+    tokio::spawn(shutdown_on_signal(handle.clone()));
+
     info!(bind = %config.bind, "starting sync server");
     axum_server::bind(config.bind)
+        .handle(handle)
         .acceptor(SyncTlsAcceptor::new(tls))
         .serve(router.into_make_service())
         .await
         .map_err(|error| {
             error!(error = %error, "sync server stopped with error");
             AppError::Sync(error.to_string())
-        })
+        })?;
+    info!("sync server stopped");
+    Ok(())
+}
+
+const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(10);
+
+async fn shutdown_on_signal(handle: Handle<SocketAddr>) {
+    shutdown_signal().await;
+    info!(
+        grace_period_secs = SHUTDOWN_GRACE_PERIOD.as_secs(),
+        "shutting down sync server"
+    );
+    handle.graceful_shutdown(Some(SHUTDOWN_GRACE_PERIOD));
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(terminate) => terminate,
+        Err(error) => {
+            error!(error = %error, "failed to install SIGTERM handler");
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn request_limit_message(limit: usize) -> String {

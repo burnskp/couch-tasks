@@ -69,6 +69,7 @@ HTTPS address: HTTP and redirects are rejected.
 ## Run a server
 
 For automatic certificate setup and a managed service, see [NixOS setup](nix.md#nixos-sync-server).
+For a container deployment, see [run with Docker](#run-with-docker).
 For a temporary local trial, see [try sync locally](#try-sync-locally).
 
 For manual hosting, install `ct-sync-server` using the [Cargo installation](../README.md#install).
@@ -92,7 +93,8 @@ ct-sync-server \
 
 Allow the chosen TCP port through your firewall if clients connect remotely.
 The server runs in the foreground; use your process supervisor for persistent
-hosting. Stop a foreground instance with Ctrl-C.
+hosting. Stop a foreground instance with Ctrl-C. On Ctrl-C or SIGTERM the server
+stops accepting connections and lets in-flight requests finish for up to 10 seconds.
 
 | Flag | Environment variable | Standalone default |
 | --- | --- | --- |
@@ -120,6 +122,76 @@ curl --cacert server-ca.crt --cert client.crt --key client.key \
 ```
 
 It should return `ok`. A request without a trusted client certificate fails.
+
+## Run with Docker
+
+The repository's `Dockerfile` builds a minimal image that runs `ct-sync-server`
+as an unprivileged user (uid/gid `65532`) and listens on port `51401`. It uses
+two volumes:
+
+| Path | Purpose |
+| --- | --- |
+| `/certs` | PEM certificates you provide; mount read-only. |
+| `/data` | The sync database, `/data/tasks.db`. |
+
+Create these files in a certificate directory before starting the container:
+
+- `server.crt`: the server certificate, valid for every DNS name or IP clients
+  use to reach the host (not the container name).
+- `server.key`: the server's private key.
+- `ca.crt`: the CA certificate that signs client certificates. Clients also need
+  the CA certificate that signed `server.crt` to verify the server.
+
+The image does not generate certificates. You can create them with
+`scripts/ct-sync-bootstrap-certs.sh` and `scripts/ct-sync-client-cert.sh`, or
+with your own CA tooling. Keep the CA private key out of the certificate
+directory you mount; the server does not need it.
+
+The container user must be able to read the certificate files:
+
+```sh
+sudo chown 65532:65532 certs/server.key
+sudo chmod 0400 certs/server.key
+chmod 0644 certs/server.crt certs/ca.crt
+```
+
+Build and run the image:
+
+```sh
+docker build -t couch-tasks-sync-server .
+docker run -d --name ct-sync-server --restart unless-stopped \
+  -p 51401:51401 \
+  -v "$PWD/certs:/certs:ro" \
+  -v ct-sync-data:/data \
+  couch-tasks-sync-server
+```
+
+Or use the example `compose.yaml`, which mounts `./certs` and a named data
+volume:
+
+```sh
+docker compose up -d
+```
+
+If you bind-mount a host directory at `/data` instead of using a named volume,
+make it writable by uid `65532`.
+
+The image sets these defaults; override them with `-e` or the compose
+`environment` section:
+
+| Environment variable | Image default |
+| --- | --- |
+| `CT_SYNC_BIND` | `0.0.0.0:51401` |
+| `CT_SYNC_DB` | `/data/tasks.db` |
+| `CT_SYNC_SERVER_CERT` | `/certs/server.crt` |
+| `CT_SYNC_SERVER_KEY` | `/certs/server.key` |
+| `CT_SYNC_CLIENT_CA` | `/certs/ca.crt` |
+
+You can also set `CT_SYNC_MAX_REQUEST_BYTES` and `RUST_LOG`. View logs with
+`docker logs ct-sync-server`. The image has no built-in health check because
+`/healthz` requires a client certificate. Use the `curl` check in
+[run a server](#run-a-server) from a client instead. The server reads its
+certificates at startup, so restart the container after replacing them.
 
 ## Try sync locally
 

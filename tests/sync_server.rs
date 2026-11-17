@@ -598,6 +598,33 @@ fn large_snapshots_sync_and_configured_limits_fail_atomically_then_recover() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn server_exits_cleanly_on_sigterm() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    generate_certificates(dir.path());
+    let port = free_port();
+    let url = format!("https://localhost:{port}");
+    let mut server = start_server(dir.path(), port, &dir.path().join("server.db"));
+    wait_for_server(&url, dir.path());
+
+    let pid = server.child.id().to_string();
+    let status = Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .expect("send SIGTERM");
+    assert!(status.success(), "kill -TERM failed");
+
+    for _ in 0..50 {
+        if let Some(status) = server.child.try_wait().expect("poll server") {
+            assert!(status.success(), "server exited with {status}");
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("server did not exit after SIGTERM");
+}
+
 #[test]
 fn server_rejects_invalid_request_limits() {
     for invalid in ["0", "-1", "invalid", "184467440737095516160"] {

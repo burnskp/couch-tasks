@@ -1,0 +1,21 @@
+# Example deployment for the Couch Tasks sync server.
+#
+# Put server.crt, server.key, and ca.crt in ./certs before starting. The
+# container runs as uid 65532, which must be able to read those files.
+# See docs/sync.md#run-with-docker.
+services:
+  ct-sync-server:
+    image: ghcr.io/burnskp/couch-tasks-sync-server:latest
+    build: .
+    restart: unless-stopped
+    ports:
+      - "51401:51401"
+    volumes:
+      - ./certs:/certs:ro
+      - ct-sync-data:/data
+    # environment:
+    #   CT_SYNC_MAX_REQUEST_BYTES: "33554432"
+    #   RUST_LOG: "couch_tasks::sync_server=debug,ct_sync_server=info"
+
+volumes:
+  ct-sync-data:
